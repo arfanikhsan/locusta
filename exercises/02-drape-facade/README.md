@@ -28,7 +28,7 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `grab` | bool | Boolean Toggle | True = drag the cloth with the mouse |
    | `anchors` | Point3d, **List Access** | Point (set from Rhino) | optional: points that hold the fabric |
    | `rail` | GeometryBase | Curve **or** planar strip Surface | Curve = thin cloth, Surface = thick cloth |
-   | `start` | int | Number Slider | -1, 0, 1 (1 = fall from behind, 0 = already hanging) |
+   | `start` | int | Number Slider | -1 to 2 (1 behind, -1 front, 0 hanging, 2 from the top) |
    | `drop` | float | Number Slider | hanging length, e.g. 400 (cm) |
    | `fullness` | float | Number Slider | 1.0 – 2.5 |
    | `pleats` | int | Number Slider | 3 – 20 (fewer = bigger folds) |
@@ -40,7 +40,9 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `iterations` | int | Number Slider | 300 – 3000 (max after a change) |
    | `gravity` | float | Number Slider | 0.02 – 0.3 (relative, unit-free) |
    | `stiffness` | float | Number Slider | 0.5 – 1.0 |
-   | `bend` | float | Number Slider | 0 – 1 |
+   | `bend` | float | Number Slider | 0 – 1 (default 0.1) |
+   | `compression` | float | Number Slider | 0 – 1, resistance to squashing (low = more wrinkles, default 0.2) |
+   | `friction` | float | Number Slider | 0 – 2, grip on colliders and floor (default 0.8) |
    | `wind` | Vector3d | Vector XYZ | relative like gravity, e.g. (0, 0.03, 0) |
    | `colliders` | GeometryBase, **List Access** | Brep / Mesh / SubD | the frame, sculpture… |
    | `thickness` | float | Number Slider | gap to colliders and floor, model units (e.g. 2 – 10 cm) |
@@ -75,7 +77,7 @@ folds, wraps over objects (colliders) and can pool on the floor.
 - For cartoon fabric (in cm): strip width 20–50, `pleats` 4–8, `bend` 0.3–0.6,
   `fullness` 1.5–2. Lower `bend` if the info panel shows a high max stretch.
 
-## Falling start
+## Start positions
 - `start = 1` (default): the fabric starts as a flat, horizontal sheet at
   rail height, **behind** the rail, and falls and swings down under gravity.
   Behind means away from where frames usually stand, so it doesn't swing
@@ -83,8 +85,25 @@ folds, wraps over objects (colliders) and can pool on the floor.
 - `start = -1`: the same, from the other side. If it starts on the wrong
   side, use this (or flip the rail curve's direction).
 - `start = 0`: starts already hanging straight down (the old behaviour).
+- `start = 2`: **from the top**. A free, flat sheet at rail height, centred
+  on the rail, with nothing pinned. It drops straight down onto whatever is
+  underneath, like a tablecloth thrown over a table. The rail sets the
+  sheet's length and position, `drop` its width. Put the rail above your
+  objects; use `anchors` if some points should stay put.
 - To slow the fall down, lower `gravity` or `steps`. The motion is speed
   limited (half a grid spacing per step) so the fabric can't fold through itself.
+
+## Wrinkles and friction
+Real cloth stretches very little but hardly resists being squashed: where it
+lands on something, it buckles into wrinkles instead of sliding off.
+- `compression` (default 0.2): how much the fabric resists squashing. Lower
+  = more and finer wrinkles. 1 = squashes like it stretches (the old, slick
+  behaviour).
+- `friction` (default 0.8): how much it grips colliders and the floor. It
+  grips with the fabric's weight, like real friction: small sliding stops
+  completely (it sticks), larger sliding is slowed down. 0 = ice, 1.5+ = rubbery.
+- `bend` (default 0.1): stiffer fabric makes fewer, larger wrinkles.
+- Wrinkles need enough points: use at least about 80 × 80 for a drape over an object.
 
 ## Units
 Any unit works. `gravity` and `wind` are relative to `drop`, so the same
@@ -133,6 +152,9 @@ If it doesn't react, read the `grab ON:` part of the `info` panel:
 - `clicks` rise but `hits 0` → the click missed the fabric; click closer to the mesh.
 - `error …` → send me that text.
 
+(Earlier versions failed on every left click with a `CoordinateSystem` error:
+that class lives in `Rhino.DocObjects`, not `Rhino.Geometry`. Fixed.)
+
 ### With anchor points (always works)
 Connect points to `anchors` (e.g. a Point parameter with points set from
 Rhino). Each point grabs the fabric point nearest to it and holds it there.
@@ -146,19 +168,27 @@ Anchors are paired with fabric points when the number of anchors changes.
   and `variation` makes them uneven so they look natural. The folded top edge
   is resampled so the points are evenly spaced along the fabric.
 - Each step, gravity pulls the points down (Verlet integration, speed
-  limited), then springs pull them back to their rest lengths:
-  - **stretch** springs: up/down and left/right neighbours
+  limited). Contacts with colliders and the floor are handled right away,
+  with friction, then springs pull the points back to their rest lengths:
+  - **stretch** springs: up/down and left/right neighbours. Stiff when
+    stretched, soft (`compression`) when squashed, so the fabric wrinkles
   - **shear** springs: diagonal neighbours
   - **bend** springs: points 2 apart, and for thick fabric points 2 × fabric
     thickness apart. They only push apart, so they stop tight creases but
     leave big folds alone
-  - **tethers**: a point can't move farther from its pinned top point than
-    the fabric length between them, so the cloth doesn't stretch like rubber
+  - **long-range limits**: points 4, 16 and 64 apart along the fabric can't be
+    farther apart in space than the fabric between them, so even a free sheet
+    doesn't stretch like rubber
+  - **tethers** (pinned fabric): a point can't move farther from its pinned
+    top point than the fabric length between them
 - **Self-collision** (thick fabric): points in the same row that are close in
   space but far apart along the fabric are pushed at least one thickness apart.
 - **Colliders:** points closer than the gap are pushed out along the distance
-  grid's gradient, with some friction. Points below the floor gap stop there,
-  so extra fabric pools on the floor.
+  grid's gradient, with Coulomb friction. Points below the floor gap stop there,
+  so extra fabric pools on the floor. A final push-only pass at the end of
+  each step makes sure nothing stays inside.
+- The `info` panel shows `stretch` as the 99th percentile, and the single
+  worst spring as `max` (often one spot at a sharp corner).
 
 ## Facade like the reference image
 1. Draw the facade rail: a line or slight arc along the top of the ground
