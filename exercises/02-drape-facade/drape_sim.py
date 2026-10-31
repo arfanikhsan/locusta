@@ -56,6 +56,11 @@ import math
 import time
 import numpy as np
 
+# Bump this whenever the Cloth / FieldCollider code changes. Saved simulation
+# state from another version is thrown away instead of reused (objects saved
+# by an older script don't have the new attributes and would crash).
+STATE_VERSION = 4
+
 # ----------------------------------------------------------------------------
 # core (NumPy only, no Rhino needed)
 # ----------------------------------------------------------------------------
@@ -626,7 +631,11 @@ def _install_grab(comp, st):
 
 def run_grasshopper():
     comp = ghenv.Component
-    store = sc.sticky.setdefault("drape_sim", {})
+    key = "drape_sim_state_v{}".format(STATE_VERSION)
+    for k in list(sc.sticky.keys()):
+        if (k == "drape_sim" or str(k).startswith("drape_sim_state")) and k != key:
+            sc.sticky.pop(k, None)          # drop state saved by older versions
+    store = sc.sticky.setdefault(key, {})
     sid = str(comp.InstanceGuid)
     st = store.get(sid) or {}
 
