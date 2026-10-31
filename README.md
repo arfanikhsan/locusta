@@ -7,6 +7,7 @@ My Rhino + Grasshopper practice, working from intermediate to advanced.
 | # | Exercise | Status |
 |---|----------|--------|
 | 01 | [Physical Ripple Simulation](exercises/01-ripple-simulation) | 🟨 In progress |
+| 02 | [Drape Facade](exercises/02-drape-facade) | 🟨 In progress |
 
 Status: ⬜ not started · 🟨 in progress · ✅ done
 
