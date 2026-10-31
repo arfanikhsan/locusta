@@ -1,0 +1,22 @@
+# Rhino backups and lock files
+*.3dmbak
+*.rhl
+*.bak
+*.tmp
+
+# Grasshopper autosave / backup
+*.gh~
+*.ghx~
+*_autosave*
+
+# Rhino render / cache
+*.rvb~
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

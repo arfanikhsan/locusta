@@ -1,0 +1,12 @@
+# Binary Rhino / Grasshopper files — never diff or merge as text
+*.3dm binary
+*.gh  binary
+*.ghuser binary
+
+# XML Grasshopper files are text, but merging them is unsafe
+*.ghx text merge=binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
