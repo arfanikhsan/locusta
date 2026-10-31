@@ -8,19 +8,22 @@ sculptural frame. The fabric hangs from a top rail, gathers into vertical
 folds, wraps over objects (colliders) and can pool on the floor.
 
 ## Files
-- `drape_sim.py` — cloth simulation for a Python script component
+- `drape_sim.py` — live cloth simulation for the Rhino 8 Python 3 script component (uses NumPy)
 - `definition.gh` — save your Grasshopper definition here
 - `images/` — screenshots
 
 ## Setup in Grasshopper (Rhino 8)
 
 1. Place a **Python 3 Script** component (Maths tab → Script, or double-click the canvas and type `python`).
-2. Open it and paste in all of `drape_sim.py`.
+2. Open it and paste in all of `drape_sim.py`. The first line, `# r: numpy`,
+   makes Rhino install NumPy the first time it runs (needs internet once).
 3. Zoom in on the component and use the ⊕ / ⊖ buttons to create these **inputs**
    (names must match exactly). Right-click each one to set **Type hint**, and set **List Access** for `colliders`:
 
    | Input | Type hint | Connect | Suggested range |
    |-------|-----------|---------|-----------------|
+   | `run` | bool | Boolean Toggle | True = simulate live |
+   | `reset` | bool | Button | restart from the flat fabric |
    | `rail` | Curve | Curve (set from Rhino) | top edge of the fabric |
    | `drop` | float | Number Slider | 1 – 10 |
    | `fullness` | float | Number Slider | 1.0 – 2.5 |
@@ -29,7 +32,8 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `variation` | float | Number Slider | 0 – 1 |
    | `res_u` | int | Number Slider | 20 – 120 |
    | `res_v` | int | Number Slider | 10 – 80 |
-   | `iterations` | int | Number Slider | 50 – 500 |
+   | `steps` | int | Number Slider | 1 – 20 (iterations per frame) |
+   | `iterations` | int | Number Slider | 100 – 1000 (max after a change) |
    | `gravity` | float | Number Slider | 0.002 – 0.03 |
    | `stiffness` | float | Number Slider | 0.5 – 1.0 |
    | `bend` | float | Number Slider | 0 – 0.5 |
@@ -43,9 +47,35 @@ folds, wraps over objects (colliders) and can pool on the floor.
    hanging 4 m from a rail at z = 4.
 
 4. Create these **outputs**: `mesh`, `surface`, `points`, `info`.
-5. Connect a Panel to `info` to read the fold count and how much the fabric stretched.
+5. Connect a Panel to `info` to see the state, iteration count, time per frame and stretch.
 
-> Rhino 7: use the **GhPython** component instead. The same script works.
+> Rhino 7: this version needs Rhino 8 (Python 3 + NumPy). The older pure-Python
+> version is in the git history (commit `dc30d7c`) and works in GhPython.
+
+## Live mode
+The component works like the Kangaroo solver: it runs `steps` iterations,
+redraws, then schedules itself again, so you watch the cloth settle and can
+keep dragging sliders. The component label shows `running`, `settled` or `paused`.
+
+- **Shape sliders** (`rail`, `drop`, `fullness`, `pleats`, `pleat_depth`,
+  `variation`, `res_u`, `res_v`, `seed`) rebuild the fabric and start again.
+- **Physics sliders** (`gravity`, `stiffness`, `bend`, `wind`, `colliders`,
+  `thickness`, `floor_z`) change the running cloth live, without a restart.
+  Try dragging `wind` and watch the curtain blow.
+- It stops by itself once the cloth stops moving, or after `iterations`.
+  Any slider change wakes it up again.
+- `run` = False pauses it. The `reset` button drops the fabric again.
+- `surface` is only built once the cloth has settled (or is paused), because
+  fitting a NURBS surface every frame would slow the preview down.
+
+### Why it's lighter now
+- All points are updated together with NumPy array maths instead of a Python
+  loop per point. The springs are grouped into sets that never share a point,
+  so each set can be solved in one array operation.
+- Only points inside the collider's bounding box call Rhino's closest-point
+  search, and only every second iteration.
+- In a plain-Python test (61 × 40 points, sphere obstacle) this version ran
+  150 iterations in about 0.7 s, vs about 4.3 s before, at about 25 ms per frame.
 
 ## How it works
 - The fabric is a grid of points. The top row is pinned along the rail.
@@ -77,10 +107,10 @@ folds, wraps over objects (colliders) and can pool on the floor.
 ## Tips
 - Start with low `res_u` and `res_v` (about 30 × 20) while you set things up.
   Increase them for the final result, because simulation time grows with point count.
-- If the fabric still looks like it's falling, raise `iterations`.
+- If the preview feels choppy, lower `steps`. If it settles too slowly, raise it.
+- If it stops before the fabric has finished falling, raise `iterations`.
 - If it passes through thin colliders, increase `thickness` or the resolution.
-- Use Data Dam or a Boolean Toggle (via Stream Gate) so the simulation
-  doesn't re-run every time you move a slider.
+- Bake the mesh, or connect `surface` to the next step, once the label says `settled`.
 
 ## Alternative: Kangaroo2 version
 Build the same thing with standard components to compare:
