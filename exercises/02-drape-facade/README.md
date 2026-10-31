@@ -24,6 +24,7 @@ folds, wraps over objects (colliders) and can pool on the floor.
    |-------|-----------|---------|-----------------|
    | `run` | bool | Boolean Toggle | True = simulate live |
    | `reset` | bool | Button | restart from the flat fabric |
+   | `grab` | bool | Boolean Toggle | True = drag the cloth with the mouse |
    | `rail` | Curve | Curve (set from Rhino) | top edge of the fabric |
    | `drop` | float | Number Slider | 1 – 10 |
    | `fullness` | float | Number Slider | 1.0 – 2.5 |
@@ -38,7 +39,7 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `stiffness` | float | Number Slider | 0.5 – 1.0 |
    | `bend` | float | Number Slider | 0 – 0.5 |
    | `wind` | Vector3d | Vector XYZ | e.g. (0, 0.003, 0) |
-   | `colliders` | GeometryBase, **List Access** | Brep / Mesh | the frame, sculpture… |
+   | `colliders` | GeometryBase, **List Access** | Brep / Mesh / SubD | the frame, sculpture… |
    | `thickness` | float | Number Slider | 0.02 – 0.1 |
    | `floor_z` | float | Number Slider | ground height |
    | `seed` | int | Number Slider | 0 – 100 |
@@ -51,6 +52,15 @@ folds, wraps over objects (colliders) and can pool on the floor.
 
 > Rhino 7: this version needs Rhino 8 (Python 3 + NumPy). The older pure-Python
 > version is in the git history (commit `dc30d7c`) and works in GhPython.
+
+## Moving the fabric with the cursor
+1. Set `grab` = True and `run` = True.
+2. In a Rhino viewport, **left-click on the fabric and drag**. The nearest
+   point (within 15 pixels) follows the cursor, on a plane facing the camera.
+   Let go and the fabric swings back. The label shows `grabbing`.
+3. Clicks that miss the fabric work as normal Rhino clicks. Right-drag still
+   rotates the view, so rotate first to pull the cloth in another direction.
+4. Set `grab` = False when you're done, so left-clicks select objects again.
 
 ## Live mode
 The component works like the Kangaroo solver: it runs `steps` iterations,
@@ -103,6 +113,18 @@ keep dragging sliders. The component label shows `running`, `settled` or `paused
 5. For a satin look: `fullness` 1.8–2.2, `pleats` 12–20, `bend` 0.15, `variation` 0.4.
 6. Smooth the `mesh` output (Weaverbird Catmull-Clark, or the **SubD from Mesh**
    component) and render with a glossy pink material.
+
+## Colliders not working? Check these
+- The `info` panel shows `colliders: N (F faces)`. If it says `none` or
+  `skipped`, the input type isn't supported or nothing is connected.
+- Set `colliders` to **List Access** and the type hint to GeometryBase (or No Type Hint).
+- Collisions use the collider's outward normals. Closed solids (Pipe with caps,
+  SubD, closed mesh) work best. An open surface pushes the fabric to the
+  side its normals face; use `Flip` if it's pushed the wrong way.
+- The fabric is created hanging straight down from the rail. If the collider
+  sits right in that plane, the fabric starts inside it and is pushed out to the
+  nearest side. Move the rail slightly behind or in front of the frame.
+- If fabric still passes through a thin pipe, raise `thickness` or `res_v`.
 
 ## Tips
 - Start with low `res_u` and `res_v` (about 30 × 20) while you set things up.

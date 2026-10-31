@@ -16,6 +16,7 @@ and redrawn, so you watch it settle and can drag sliders while it runs.
 INPUTS  (right-click each input -> set Access and Type hint)
     run         bool          item   Toggle: True = simulate live            (default True)
     reset       bool          item   Button: restart from the flat fabric
+    grab        bool          item   Toggle: drag the cloth with the left mouse button
     rail        Curve         item   Top edge the fabric hangs from (default: 6 m line at z=4)
     drop        float         item   Hanging length                          (default 4.0)
     fullness    float         item   Fabric width / rail length, >1 = folds  (default 1.6)
@@ -30,8 +31,9 @@ INPUTS  (right-click each input -> set Access and Type hint)
     stiffness   float         item   0-1, stretch resistance                 (default 1.0)
     bend        float         item   0-1, bending resistance                 (default 0.1)
     wind        Vector3d      item   Optional constant push, e.g. (0, 0.003, 0)
-    colliders   GeometryBase  list   Optional Mesh / Brep obstacles
+    colliders   GeometryBase  list   Optional Mesh / Brep / SubD / Surface obstacles
     thickness   float         item   Gap kept between fabric and colliders   (default 0.05)
+                                     (also the max move per step near colliders)
     floor_z     float         item   Optional floor height for pooling fabric
     seed        int           item   Random seed                             (default 1)
 
@@ -144,37 +146,69 @@ class Cloth(object):
         b -= wb * corr
 
     def step(self, n, accel, stiffness, bend, floor_z=None, collide=None,
-             damping=0.98, passes=4, collide_every=2):
+             damping=0.98, passes=4, max_speed=None, grab=None):
+        """grab: ((i, j), target_xyz) holds one point at the cursor."""
         P, W = self.P, self.W
         accel = np.asarray(accel, float)
-        free = W > 0
         k_of = {"stretch": stiffness, "shear": stiffness * 0.5, "bend": bend}
-        for _ in range(n):
-            before = P.copy()
-            vel = (P - self.prev) * damping
-            self.prev[:] = P
-            P += (vel + accel) * W
-            for _ in range(passes):
-                for sa, sb, rest, kind in self.sets:
-                    k = k_of[kind]
-                    if k > 0:
-                        self._project(sa, sb, rest, k)
-            # tethers: no point gets further from its top point than the
-            # fabric length between them (stops rubbery stretching)
-            d = P - P[:, :1]
-            L = np.sqrt((d * d).sum(-1, keepdims=True))
-            over = L > self.tether
-            if over.any():
-                P[:] = np.where(over, P[:, :1] + d * (self.tether / np.maximum(L, 1e-12)), P)
-            if floor_z is not None:
-                low = (P[:, :, 2:3] < floor_z) & free
-                if low.any():
-                    P[:, :, 2:3] = np.where(low, floor_z, P[:, :, 2:3])
-                    self.prev[:] = np.where(low, P, self.prev)   # friction
-            self.total += 1
-            if collide is not None and self.total % collide_every == 0:
-                collide(P, self.prev, free)
-            self.motion = float(np.abs(P - before).max())
+        held_w = None
+        if grab is not None:
+            (gi, gj), target = grab
+            held_w = W[gi, gj].copy()
+            W[gi, gj] = 0.0                       # held points act pinned
+            self.prev[gi, gj] = P[gi, gj]         # so it flings when released
+            P[gi, gj] = target
+        free = W > 0
+        try:
+            for _ in range(n):
+                before = P.copy()
+                vel = (P - self.prev) * damping + accel
+                if max_speed:
+                    # never move further than max_speed per step, so points
+                    # can't jump through a thin collider between checks
+                    sp = np.sqrt((vel * vel).sum(-1, keepdims=True))
+                    vel *= np.minimum(1.0, max_speed / np.maximum(sp, 1e-12))
+                self.prev[:] = P
+                P += vel * W
+                for _ in range(passes):
+                    for sa, sb, rest, kind in self.sets:
+                        k = k_of[kind]
+                        if k > 0:
+                            self._project(sa, sb, rest, k)
+                # tethers: no point gets further from its top point than the
+                # fabric length between them (stops rubbery stretching)
+                d = P - P[:, :1]
+                L = np.sqrt((d * d).sum(-1, keepdims=True))
+                over = (L > self.tether) & free
+                if over.any():
+                    P[:] = np.where(over, P[:, :1] + d * (self.tether / np.maximum(L, 1e-12)), P)
+                if floor_z is not None:
+                    low = (P[:, :, 2:3] < floor_z) & free
+                    if low.any():
+                        P[:, :, 2:3] = np.where(low, floor_z, P[:, :, 2:3])
+                        self.prev[:] = np.where(low, P, self.prev)   # friction
+                if collide is not None:
+                    collide(P, self.prev, free)
+                self.total += 1
+                self.motion = float(np.abs(P - before).max())
+        finally:
+            if held_w is not None:
+                W[gi, gj] = held_w
+
+    def nearest_on_screen(self, M, x, y, radius):
+        """Index of the cloth point closest to screen pixel (x, y), using the
+        4x4 world->screen matrix M. None if nothing within radius pixels."""
+        pts = self.P.reshape(-1, 3)
+        h = pts @ M[:3, :3].T + M[:3, 3]
+        w = pts @ M[3, :3] + M[3, 3]
+        ok = w > 1e-9                                # in front of the camera
+        sx = h[:, 0] / np.where(ok, w, 1.0)
+        sy = h[:, 1] / np.where(ok, w, 1.0)
+        d2 = np.where(ok, (sx - x) ** 2 + (sy - y) ** 2, np.inf)
+        k = int(np.argmin(d2))
+        if d2[k] > radius * radius:
+            return None
+        return divmod(k, self.nv)
 
     def max_strain(self):
         """Largest stretch (tension) of the stretch springs, as a ratio."""
@@ -193,6 +227,8 @@ class Cloth(object):
 # grasshopper
 # ----------------------------------------------------------------------------
 try:
+    import Rhino
+    import Rhino.UI
     import Rhino.Geometry as rg
     import scriptcontext as sc
     import Grasshopper
@@ -206,48 +242,101 @@ def _val(name, default):
     return default if v is None else v
 
 
+def _to_geometry(g):
+    """Rhino object ids (Guid) -> geometry, Grasshopper wrappers -> geometry."""
+    if g is None:
+        return None
+    if hasattr(g, "Value") and not isinstance(g, rg.GeometryBase):
+        g = g.Value                                   # GH_Brep, GH_Mesh, ...
+    if not isinstance(g, rg.GeometryBase):
+        try:
+            obj = Rhino.RhinoDoc.ActiveDoc.Objects.FindId(g)
+            g = obj.Geometry if obj else None
+        except Exception:
+            g = None
+    return g
+
+
 def _collider_mesh(geos):
+    """Joins every collider into one mesh. Returns (mesh, report text)."""
     joined = rg.Mesh()
+    used, skipped = 0, []
     for g in geos or []:
+        g = _to_geometry(g)
         if g is None:
-            continue
-        if isinstance(g, rg.Mesh):
-            joined.Append(g)
             continue
         if isinstance(g, (rg.Extrusion, rg.Surface)):
             g = g.ToBrep()
-        if isinstance(g, rg.Brep):
-            for m in rg.Mesh.CreateFromBrep(g, rg.MeshingParameters.Default) or []:
-                joined.Append(m)
+        part = None
+        if isinstance(g, rg.Mesh):
+            part = g
+        elif isinstance(g, rg.SubD):
+            part = rg.Mesh.CreateFromSubD(g, 2)
+        elif isinstance(g, rg.Brep):
+            mp = rg.MeshingParameters.QualityRenderMesh
+            part = rg.Mesh()
+            for m in rg.Mesh.CreateFromBrep(g, mp) or []:
+                part.Append(m)
+        if part is not None and part.Vertices.Count > 0:
+            joined.Append(part)
+            used += 1
+        else:
+            skipped.append(type(g).__name__)
     if joined.Vertices.Count == 0:
-        return None
+        return None, "colliders: none" + (" (unsupported: {})".format(
+            ", ".join(skipped)) if skipped else "")
+    if joined.SolidOrientation() == -1:               # closed but inside-out
+        joined.Flip(True, True, True)
     joined.Normals.ComputeNormals()
     joined.FaceNormals.ComputeFaceNormals()
-    return joined
+    txt = "colliders: {} ({} faces)".format(used, joined.Faces.Count)
+    if skipped:
+        txt += " skipped: " + ", ".join(skipped)
+    return joined, txt
 
 
-def _make_collider(cmesh, thickness):
+def _make_collider(cmesh, thickness, max_speed, refresh=8):
+    """Pushes points out of the collider mesh, keeping a `thickness` gap.
+
+    Broad phase: every `refresh` steps NumPy picks the points inside the
+    collider's bounding box and Rhino measures how far they are from the
+    surface. Only points close enough to touch it before the next refresh
+    (they can move at most max_speed per step) are tested every step."""
     bb = cmesh.GetBoundingBox(True)
-    bb.Inflate(thickness * 2)
-    lo = np.array([bb.Min.X, bb.Min.Y, bb.Min.Z])
-    hi = np.array([bb.Max.X, bb.Max.Y, bb.Max.Z])
-    search = thickness * 4
+    pad = thickness + max_speed * refresh
+    lo = np.array([bb.Min.X, bb.Min.Y, bb.Min.Z]) - pad
+    hi = np.array([bb.Max.X, bb.Max.Y, bb.Max.Z]) + pad
+    state = {"count": 0, "near": None}
+
+    def signed_push(P, prev, i, j):
+        x, y, z = P[i, j]
+        # no distance limit: points that ended up deep inside still find
+        # their way out (a limited search returns nothing for them)
+        mp = cmesh.ClosestMeshPoint(rg.Point3d(x, y, z), 0.0)
+        if mp is None:
+            return float("inf")
+        cp = mp.Point
+        n = cmesh.NormalAt(mp)
+        n.Unitize()
+        dist = (x - cp.X) * n.X + (y - cp.Y) * n.Y + (z - cp.Z) * n.Z
+        if dist < thickness:
+            P[i, j] = (cp.X + n.X * thickness, cp.Y + n.Y * thickness,
+                       cp.Z + n.Z * thickness)
+            prev[i, j] = P[i, j]                      # friction
+        return dist
 
     def collide(P, prev, free):
-        # NumPy picks the few points near the collider; only those call Rhino
-        near = np.all((P >= lo) & (P <= hi), axis=-1) & free[..., 0]
-        for i, j in zip(*np.nonzero(near)):
-            x, y, z = P[i, j]
-            mp = cmesh.ClosestMeshPoint(rg.Point3d(x, y, z), search)
-            if mp is None:
-                continue
-            cp = mp.Point
-            n = cmesh.NormalAt(mp)
-            n.Unitize()
-            if (x - cp.X) * n.X + (y - cp.Y) * n.Y + (z - cp.Z) * n.Z < thickness:
-                P[i, j] = (cp.X + n.X * thickness, cp.Y + n.Y * thickness,
-                           cp.Z + n.Z * thickness)
-                prev[i, j] = P[i, j]                      # friction
+        if state["count"] % refresh == 0 or state["near"] is None:
+            near = np.zeros(P.shape[:2], bool)
+            inside_box = np.all((P >= lo) & (P <= hi), axis=-1) & free[..., 0]
+            for i, j in zip(*np.nonzero(inside_box)):
+                if signed_push(P, prev, i, j) < pad:
+                    near[i, j] = True
+            state["near"] = near
+        else:
+            for i, j in zip(*np.nonzero(state["near"] & free[..., 0])):
+                signed_push(P, prev, i, j)
+        state["count"] += 1
     return collide
 
 
@@ -266,6 +355,7 @@ def _rail_frames(crv, nu):
 def _geo_key(geos):
     key = []
     for g in geos or []:
+        g = _to_geometry(g)
         if g is not None:
             b = g.GetBoundingBox(False)
             key.append((type(g).__name__,) + tuple(round(v, 5) for v in
@@ -297,6 +387,95 @@ def _schedule_next(comp, ms):
         doc.ScheduleSolution(ms, again)
 
 
+# --- cursor grabbing ---------------------------------------------------------
+# Rhino sends viewport mouse events to a MouseCallback. The class is created
+# only once per Rhino session (a .NET type can't be defined twice), and it just
+# forwards events to handler functions that every script run replaces.
+
+def _mouse_callback():
+    cb = sc.sticky.get("drape_sim_mouse")
+    if cb is not None:
+        return cb
+
+    def forward(kind, e):
+        h = sc.sticky.get("drape_sim_handlers", {}).get(kind)
+        if h is not None:
+            try:
+                h(e)
+            except Exception as ex:
+                Rhino.RhinoApp.WriteLine("drape grab: {}".format(ex))
+
+    class DrapeMouse(Rhino.UI.MouseCallback):
+        __namespace__ = "LocustaDrape"
+
+        def OnMouseDown(self, e):
+            forward("down", e)
+
+        def OnMouseMove(self, e):
+            forward("move", e)
+
+        def OnMouseUp(self, e):
+            forward("up", e)
+
+    cb = DrapeMouse()
+    sc.sticky["drape_sim_mouse"] = cb
+    return cb
+
+
+def _is_left(e):
+    try:
+        return str(e.MouseButton).endswith("Left")
+    except Exception:
+        return str(e.Button).endswith("Left")
+
+
+def _install_grab(comp, st):
+    def wake():
+        cloth = st.get("cloth")
+        if cloth is not None:
+            cloth.total, cloth.motion = 0, float("inf")
+        if not st.get("running"):          # already looping otherwise
+            comp.ExpireSolution(True)
+
+    def down(e):
+        cloth = st.get("cloth")
+        if cloth is None or not _is_left(e):
+            return
+        vp = e.View.ActiveViewport
+        xf = vp.GetTransform(rg.CoordinateSystem.World, rg.CoordinateSystem.Screen)
+        M = np.array([[getattr(xf, "M{}{}".format(r, c)) for c in range(4)]
+                      for r in range(4)])
+        hit = cloth.nearest_on_screen(M, e.ViewportPoint.X, e.ViewportPoint.Y, 15)
+        if hit is None:
+            return                         # missed the cloth: normal Rhino click
+        x, y, z = cloth.P[hit]
+        st["grab"] = {"idx": hit, "target": np.array([x, y, z]),
+                      "plane": rg.Plane(rg.Point3d(x, y, z), vp.CameraDirection)}
+        e.Cancel = True                    # don't start a selection window
+        wake()
+
+    def move(e):
+        g = st.get("grab")
+        if g is None:
+            return
+        ok, line = e.View.ActiveViewport.GetFrustumLine(e.ViewportPoint.X,
+                                                        e.ViewportPoint.Y)
+        if ok:
+            hit, t = rg.Intersection.LinePlane(line, g["plane"])
+            if hit:
+                p = line.PointAt(t)
+                g["target"] = np.array([p.X, p.Y, p.Z])
+        e.Cancel = True
+        wake()
+
+    def up(e):
+        if st.pop("grab", None) is not None:
+            e.Cancel = True
+            wake()
+
+    sc.sticky["drape_sim_handlers"] = {"down": down, "move": move, "up": up}
+
+
 def run_grasshopper():
     comp = ghenv.Component
     store = sc.sticky.setdefault("drape_sim", {})
@@ -317,7 +496,8 @@ def run_grasshopper():
     cloth = st.get("cloth")
     if cloth is None or bool(_val("reset", False)) or st.get("shape_key") != shape_key:
         cloth = Cloth(top, side, crv.GetLength(), *shape)
-        st = {"cloth": cloth, "shape_key": shape_key}
+        st.clear()                          # keep the same dict: grab handlers use it
+        st.update({"cloth": cloth, "shape_key": shape_key})
         store[sid] = st
 
     # physics: applied live, any change wakes the cloth up again
@@ -327,29 +507,56 @@ def run_grasshopper():
     stiffness = float(_val("stiffness", 1.0))
     bend = float(_val("bend", 0.1))
     floor_z = _val("floor_z", None)
-    thickness = float(_val("thickness", 0.05))
+    thickness = max(1e-4, float(_val("thickness", 0.05)))
     geos = _val("colliders", None)
-    if isinstance(geos, rg.GeometryBase):        # item access instead of list
-        geos = [geos]
+    if geos is not None and not isinstance(geos, (list, tuple)) and \
+            (isinstance(geos, rg.GeometryBase) or not hasattr(geos, "__iter__")):
+        geos = [geos]                       # item access instead of list
+    max_speed = None
     ckey = (_geo_key(geos), thickness)
     if st.get("ckey") != ckey:
-        cmesh = _collider_mesh(geos)
-        st["collide"] = _make_collider(cmesh, thickness) if cmesh else None
+        cmesh, st["ctext"] = _collider_mesh(geos)
+        st["cmesh"] = cmesh
         st["ckey"] = ckey
+        st["collide"] = None
+        if cmesh is not None:
+            st["collide"] = _make_collider(cmesh, thickness, max(thickness, 0.5 * cloth.dv))
+    if st.get("cmesh") is not None:
+        # with colliders, points move at most max_speed per step (no tunnelling)
+        max_speed = max(thickness, 0.5 * cloth.dv)
     phys_key = (accel, stiffness, bend, floor_z, ckey)
     if st.get("phys_key") != phys_key:
         st["phys_key"] = phys_key
         cloth.total = 0
         cloth.motion = float("inf")
 
+    # cursor grabbing
+    grab_on = bool(_val("grab", False))
+    grab_err = ""
+    try:
+        cb = _mouse_callback()
+        if grab_on:
+            _install_grab(comp, st)
+        cb.Enabled = grab_on
+    except Exception as ex:
+        grab_on = False
+        grab_err = " | grab unavailable: {}".format(ex)
+    if not grab_on:
+        st.pop("grab", None)
+    held = st.get("grab")
+    grab = (held["idx"], held["target"]) if held else None
+
     run = bool(_val("run", True))
     max_it = max(1, int(_val("iterations", 400)))
-    settled = cloth.total >= max_it or cloth.motion < 1e-5 * cloth.dv
+    def is_settled():
+        return held is None and (cloth.total >= max_it or cloth.motion < 1e-5 * cloth.dv)
+    settled = is_settled()
     t0 = time.time()
     if run and not settled:
         cloth.step(max(1, int(_val("steps", 5))), accel, stiffness, bend,
-                   floor_z=floor_z, collide=st.get("collide"))
-        settled = cloth.total >= max_it or cloth.motion < 1e-5 * cloth.dv
+                   floor_z=floor_z, collide=st.get("collide"),
+                   max_speed=max_speed, grab=grab)
+        settled = is_settled()
     ms = (time.time() - t0) * 1000.0
 
     m = _quad_mesh(cloth)
@@ -360,12 +567,16 @@ def run_grasshopper():
         srf = rg.NurbsSurface.CreateFromPoints(pts, cloth.nu, cloth.nv, 3, 3)
 
     state = "settled" if settled else ("running" if run else "paused")
+    if held is not None:
+        state = "grabbing"
     txt = ("{} | iteration {} | {:.0f} ms/frame | points {}x{} | folds {} | "
-           "fold depth {:.3f} | max stretch {:.1%}").format(
+           "fold depth {:.3f} | max stretch {:.1%} | {}{}").format(
         state, cloth.total, ms, cloth.nu, cloth.nv, cloth.pleats, cloth.amp,
-        cloth.max_strain())
+        cloth.max_strain(), st.get("ctext", "colliders: none"),
+        " | grab: drag the cloth with the left mouse button" if grab_on else grab_err)
     comp.Message = state
-    if run and not settled:
+    st["running"] = run and not settled
+    if st["running"]:
         _schedule_next(comp, 1)
     return m, srf, pts, txt
 
