@@ -28,7 +28,7 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `grab` | bool | Boolean Toggle | True = drag the cloth with the mouse |
    | `anchors` | Point3d, **List Access** | Point (set from Rhino) | optional: points that hold the fabric |
    | `rail` | GeometryBase | Curve **or** planar strip Surface | Curve = thin cloth, Surface = thick cloth |
-   | `start` | int | Number Slider | -1 to 2 (1 behind, -1 front, 0 hanging, 2 from the top) |
+   | `start` | int | Number Slider | -1 to 3 (1 behind, -1 front, 0 hanging, 2 from the top, 3 lowered from above) |
    | `drop` | float | Number Slider | hanging length, e.g. 400 (cm) |
    | `fullness` | float | Number Slider | 1.0 – 2.5 |
    | `pleats` | int | Number Slider | 3 – 20 (fewer = bigger folds) |
@@ -38,11 +38,12 @@ folds, wraps over objects (colliders) and can pool on the floor.
    | `res_v` | int | Number Slider | 10 – 120 |
    | `steps` | int | Number Slider | 1 – 20 (iterations per frame) |
    | `iterations` | int | Number Slider | 300 – 3000 (max after a change) |
-   | `gravity` | float | Number Slider | 0.02 – 0.3 (relative, unit-free) |
+   | `gravity` | float | Number Slider | 0.02 – 0.3 (relative to the grid spacing, unit-free) |
    | `stiffness` | float | Number Slider | 0.5 – 1.0 |
    | `bend` | float | Number Slider | 0 – 1 (default 0.1) |
    | `compression` | float | Number Slider | 0 – 1, resistance to squashing (low = more wrinkles, default 0.2) |
-   | `friction` | float | Number Slider | 0 – 2, grip on colliders and floor (default 0.8) |
+   | `friction` | float | Number Slider | 0 – 3, grip on colliders and floor (default 0.8) |
+   | `drag` | float | Number Slider | 0 – 0.1, air resistance: low = heavy fabric (default 0.02) |
    | `wind` | Vector3d | Vector XYZ | relative like gravity, e.g. (0, 0.03, 0) |
    | `colliders` | GeometryBase, **List Access** | Brep / Mesh / SubD | the frame, sculpture… |
    | `thickness` | float | Number Slider | gap to colliders and floor, model units (e.g. 2 – 10 cm) |
@@ -90,15 +91,51 @@ folds, wraps over objects (colliders) and can pool on the floor.
   underneath, like a tablecloth thrown over a table. The rail sets the
   sheet's length and position, `drop` its width. Put the rail above your
   objects; use `anchors` if some points should stay put.
+- `start = 3`: **lowered from above**. The fabric hangs from the rail edge,
+  raised by its own length, and the edge is lowered to the rail at a steady
+  speed. Whatever is longer than the space below lands on the floor or the
+  colliders and has to pile up. Make `drop` longer than the rail height (e.g.
+  rail at 400, `drop` 650) to get a heap at the base.
 - To slow the fall down, lower `gravity` or `steps`. The motion is speed
   limited (half a grid spacing per step) so the fabric can't fold through itself.
+
+## Heavy, thick fabric that piles up in layers
+For fabric that compresses into thick rounded folds when it lands, stacks
+into layered ridges, bulges where it accumulates and spreads into soft
+masses at the base (see `images/sim_heavy_pile.png`):
+
+| Setting | Value | Why |
+|---|---|---|
+| `rail` | strip surface, 20–30 cm wide | gives the fabric its thickness |
+| `start` | 3 | lowered from above, so the extra length piles up |
+| `drop` | longer than the rail height | the extra length is what piles up |
+| `drag` | 0.002 – 0.005 | heavy: keeps its momentum, slumps instead of floating |
+| `compression` | 0.8 – 1.0 | it buckles into ridges instead of squashing flat |
+| `bend` | 0.1 – 0.2 | low enough that it can fold into many ridges |
+| `friction` | 1.5 – 2.5 | the base grips the floor, so new fabric piles on top |
+| `res_u` × `res_v` | about 60 × 130 | enough points for the ridges |
+
+How it works:
+- **Thick fabric can't pass through itself**, in any direction: parts of the
+  fabric that are far apart along it but closer than the thickness are pushed
+  apart. Layers stack instead of flattening. (The search uses a hash grid on
+  a sub-grid spaced half a thickness, and runs every 2 steps.)
+- **Friction holds resting fabric** with a force set by its weight: small
+  slips are undone completely (static friction), so the base doesn't slide
+  out from under the falling fabric.
+- **Momentum**: low `drag` keeps the falling fabric moving, so it buckles
+  when it arrives instead of laying down in one neat fold.
+
+Expect about 60–90 ms per frame for this at 60 × 130 points with thickness
+(self-collision is the expensive part). Use fewer points while you set it up.
 
 ## Wrinkles and friction
 Real cloth stretches very little but hardly resists being squashed: where it
 lands on something, it buckles into wrinkles instead of sliding off.
-- `compression` (default 0.2): how much the fabric resists squashing. Lower
-  = more and finer wrinkles. 1 = squashes like it stretches (the old, slick
-  behaviour).
+- `compression` (default 0.2): how much the fabric resists squashing. Low
+  values let light fabric drape and wrinkle softly. For fabric that should
+  buckle into ridges when it piles up, use 0.8 – 1.0: too low, and it just
+  squashes flat instead of folding.
 - `friction` (default 0.8): how much it grips colliders and the floor. It
   grips with the fabric's weight, like real friction: small sliding stops
   completely (it sticks), larger sliding is slowed down. 0 = ice, 1.5+ = rubbery.
@@ -106,8 +143,9 @@ lands on something, it buckles into wrinkles instead of sliding off.
 - Wrinkles need enough points: use at least about 80 × 80 for a drape over an object.
 
 ## Units
-Any unit works. `gravity` and `wind` are relative to `drop`, so the same
-slider values behave the same in mm, cm or m. Only `drop`, `thickness`,
+Any unit works. `gravity` and `wind` are relative to the grid spacing, so the
+same slider values behave the same in mm, cm or m (and the solver stays stable
+at high resolution). Only `drop`, `thickness`,
 `pleat_depth`, `floor_z` and the rail / colliders are in model units.
 
 ## Live mode

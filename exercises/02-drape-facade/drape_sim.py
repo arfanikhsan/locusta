@@ -13,7 +13,7 @@ its thickness, so folds get bigger and rounder (cartoon fabric), folds stay
 that far apart, and the `thick_mesh` output shows the fabric's thickness.
 
 UNITS: everything scales with your model, so cm, m or mm all work. Gravity
-and wind are relative to the drop length.
+and wind are relative to the grid spacing (stable at any resolution).
 
 START:  1 = flat sheet behind the rail, swings down (pinned to the rail)
        -1 = the same from the front
@@ -21,6 +21,15 @@ START:  1 = flat sheet behind the rail, swings down (pinned to the rail)
         2 = from the top: a free flat sheet centred on the rail, nothing
             pinned, drops onto whatever is underneath (like a tablecloth;
             use `anchors` to pin points). `drop` is the sheet's width.
+        3 = lowered from above: hangs from the rail edge raised by `drop`,
+            which is lowered to the rail at a steady speed. Whatever is
+            longer than the space below lands on the floor / colliders and
+            piles up in layered ridges. Make `drop` longer than the rail
+            height for a heap at the base.
+
+HEAVY, THICK FABRIC: use a strip surface rail (fabric thickness) plus low
+`drag`, low `compression`, higher `bend` and `friction`. Thick fabric can't
+pass through itself, so where it lands it stacks into thick rounded layers.
 
 WRINKLES: cloth hardly resists being squashed, so it buckles into wrinkles
 where it lands on objects. `compression` sets how much it resists (low =
@@ -40,7 +49,8 @@ INPUTS  (right-click each input -> set Access and Type hint)
     anchors     Point3d       list   Optional points: the nearest fabric point is held at each
     rail        GeometryBase  item   Curve (thin) or planar strip Surface (thick)
                                      (default: 600 line at z=400)
-    start       int           item   1 back, -1 front, 0 hanging, 2 from the top (default 1)
+    start       int           item   1 back, -1 front, 0 hanging, 2 from the top,
+                                     3 lowered from above (default 1)
     drop        float         item   Hanging length                          (default 400)
     fullness    float         item   Fabric width / rail length, >1 = folds  (default 1.6)
     pleats      int           item   Number of folds along the rail          (default 8)
@@ -50,11 +60,12 @@ INPUTS  (right-click each input -> set Access and Type hint)
     res_v       int           item   Points down                             (default 40)
     steps       int           item   Iterations per frame                    (default 5)
     iterations  int           item   Max iterations after a change           (default 1000)
-    gravity     float         item   Pull per step, relative to drop         (default 0.1)
+    gravity     float         item   Pull per step, relative to the grid spacing (default 0.1)
     stiffness   float         item   0-1, stretch resistance                 (default 1.0)
     bend        float         item   0-1, bending resistance                 (default 0.1)
     compression float         item   0-1, resistance to squashing, low = wrinkles (default 0.2)
     friction    float         item   0-2, grip on colliders and floor        (default 0.8)
+    drag        float         item   0-0.1, air resistance: low = heavy fabric (default 0.02)
     wind        Vector3d      item   Optional push, relative like gravity, e.g. (0, 0.03, 0)
     colliders   GeometryBase  list   Optional Mesh / Brep / SubD / Surface obstacles
     thickness   float         item   Gap kept between fabric and colliders/floor
@@ -76,7 +87,7 @@ import numpy as np
 # Bump this whenever the Cloth / FieldCollider code changes. Saved simulation
 # state from another version is thrown away instead of reused (objects saved
 # by an older script don't have the new attributes and would crash).
-STATE_VERSION = 6
+STATE_VERSION = 7
 
 # ----------------------------------------------------------------------------
 # core (NumPy only, no Rhino needed)
@@ -125,17 +136,68 @@ def _length(d):
     return np.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])[None]
 
 
-def contact_friction(X, V, n, depth, mu):
-    """Coulomb friction for points pushed out of a surface (rows of (k, 3)).
-    X: positions after the push, V: previous positions, n: unit normals,
-    depth: how far each point was pushed. Sliding this step is cut by
-    mu x depth; if it's smaller than that the point sticks (static friction).
-    Returns new previous positions: no bounce, reduced sliding."""
+def close_pairs(X, r):
+    """All pairs (i < j) of rows of X (N, 3) closer than r, using a hash grid
+    (pure NumPy, no scipy needed)."""
+    N = len(X)
+    if N < 2:
+        return np.zeros(0, int), np.zeros(0, int)
+    c = np.floor((X - X.min(0)) / r).astype(np.int64) + 1
+    dims = c.max(0) + 2
+    key = c[:, 0] + dims[0] * (c[:, 1] + dims[1] * c[:, 2])
+    order = np.argsort(key, kind="stable")
+    ks = key[order]
+    Is, Js = [], []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if (dx, dy, dz) < (0, 0, 0):
+                    continue                          # each cell pair once
+                nk = key + dx + dims[0] * (dy + dims[1] * dz)
+                lo = np.searchsorted(ks, nk, "left")
+                cnt = np.searchsorted(ks, nk, "right") - lo
+                tot = int(cnt.sum())
+                if tot == 0:
+                    continue
+                I = np.repeat(np.arange(N), cnt)
+                first = np.repeat(lo - (np.cumsum(cnt) - cnt), cnt)
+                J = order[first + np.arange(tot)]
+                if (dx, dy, dz) == (0, 0, 0):
+                    m = I < J
+                    I, J = I[m], J[m]
+                Is.append(I)
+                Js.append(J)
+    if not Is:
+        return np.zeros(0, int), np.zeros(0, int)
+    I, J = np.concatenate(Is), np.concatenate(Js)
+    d = X[J] - X[I]
+    m = (d * d).sum(1) < r * r
+    return I[m], J[m]
+
+
+def grid_indices(n, stride):
+    """Every stride-th index, always including the last one."""
+    idx = list(range(0, n, stride))
+    if idx[-1] != n - 1:
+        idx.append(n - 1)
+    return np.array(idx)
+
+
+def contact_friction(X, V, n, grip, mu):
+    """Coulomb friction for points touching a surface (rows of (k, 3)).
+    X: positions (already pushed out), V: positions at the start of the step,
+    n: unit normals, grip: normal force per point as a distance per step
+    (the fabric's weight). The point's sliding this step, whatever caused
+    it (momentum or springs), is cut back by up to mu x grip; smaller slips
+    are undone completely, so resting fabric sticks (static friction).
+    Returns (new X, new V): the slip is undone in position, and the next
+    step starts with only the remaining sliding speed and no bounce."""
     d = X - V
     vt = d - (d * n).sum(1, keepdims=True) * n          # sliding part
     st = np.linalg.norm(vt, axis=1, keepdims=True)
-    keep = np.clip(1.0 - mu * depth[:, None] / np.maximum(st, 1e-12), 0.0, 1.0)
-    return X - vt * keep
+    keep = np.clip(1.0 - mu * np.reshape(grip, (-1, 1)) / np.maximum(st, 1e-12), 0.0, 1.0)
+    Xn = X - vt * (1.0 - keep)
+    return Xn, Xn - vt * keep
 
 
 class FieldCollider(object):
@@ -150,7 +212,8 @@ class FieldCollider(object):
         self.cell = float(cell)
         self.shape = np.array(phi.shape)
         self.friction = friction
-        self.depth_cap = np.inf          # max push depth counted for friction
+        self.depth_cap = 0.0             # grip (weight per step) for friction
+        self.band = 0.0                  # points this close count as touching
         self.R = np.eye(3)               # rigid move of the collider since
         self.t = np.zeros(3)             # the grid was built: x = R @ local + t
 
@@ -189,17 +252,18 @@ class FieldCollider(object):
         if idx.size == 0:
             return
         phi, g = self.sample(Xl[:, idx].T)
-        hit = phi < gap
+        hit = phi < gap + self.band                       # touching or resting
         if not hit.any():
             return
         idx, phi, n = idx[hit], phi[hit], g[hit] @ self.R.T  # normals to world
         Xi = X[:, idx].T
         n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
-        depth = gap - phi
+        depth = np.maximum(gap - phi, 0.0)
         Xi = Xi + depth[:, None] * n                      # push out to the gap
+        if self.friction > 0:
+            Xi, Vi = contact_friction(Xi, V[:, idx].T, n, self.depth_cap, self.friction)
+            V[:, idx] = Vi.T
         X[:, idx] = Xi.T
-        V[:, idx] = contact_friction(Xi, V[:, idx].T, n, np.minimum(depth, self.depth_cap),
-                                     self.friction).T
 
 
 class Cloth(object):
@@ -246,8 +310,25 @@ class Cloth(object):
         dv = drop / (nv - 1)
         P = np.repeat(base.T[:, :, None], nv, axis=2)
         pinned = start != 2
-        if not start:
-            P[2] -= np.arange(nv)[None, :] * dv           # hanging straight down
+        if start in (0, 3):
+            # hanging straight down. start 3: the same, but raised by `drop`
+            # and lowered to the rail at a steady speed (see step), so the
+            # extra length lands on what's below and piles up in layers
+            P[2] -= np.arange(nv)[None, :] * dv
+            if start == 3:
+                # a perfectly flat sheet has nothing to tip it out of its
+                # plane; real fabric does. Gentle seeded waviness lets it
+                # buckle into ridges when it lands
+                ui = np.linspace(0, 1, nu)[:, None]
+                vj = np.linspace(0, 1, nv)[None, :]
+                wav = np.zeros((nu, nv))
+                for _ in range(4):
+                    fu, fv = rnd.uniform(0.5, 2.5), rnd.uniform(1.0, 4.0) * drop / max(rail_len, 1e-9)
+                    pu, pv = rnd.uniform(0, 2 * np.pi, 2)
+                    wav += np.sin(2 * np.pi * fu * ui + pu) * np.sin(2 * np.pi * fv * vj + pv)
+                wav *= 0.5 * dv / max(np.abs(wav).max(), 1e-9)
+                sd = side / np.maximum(np.linalg.norm(side, axis=1, keepdims=True), 1e-12)
+                P += sd.T[:, :, None] * wav[None]
         elif start == 2:
             # free flat sheet at rail height, centred on the rail, nothing
             # pinned: it drops from the top onto whatever is underneath
@@ -281,12 +362,20 @@ class Cloth(object):
         self.prev = self.P.copy()         # previous positions (Verlet)
         self.W = np.ones((1, nu, nv))     # inverse mass, 0 = pinned
         self.pinned = pinned
+        # start 3: the pinned top edge starts `drop` higher and is lowered
+        self.top_rest = P[:, :, 0].copy()
+        self.lift = drop if start == 3 else 0.0
+        if self.lift:
+            P[2] += self.lift
         if pinned:
             self.W[:, :, 0] = 0.0         # top row hangs from the rail
         self.tether = (np.arange(nv) * dv)[None, None, :] * 1.0001
         self.sets = _constraint_sets(nu, nv, du, dv)
         self.nu, self.nv, self.du, self.dv = nu, nv, du, dv
-        self.scale = drop / 40.0          # unit-free gravity / wind reference
+        # unit-free gravity / wind reference: the grid spacing down the fabric.
+        # (the solver's stiffness depends on how far points move per step
+        # compared to their spacing, so this keeps it stable at any resolution)
+        self.scale = dv
         self.amp, self.pleats = amp, pleats
         self.total = 0                    # iterations since the last change
         self.motion = float("inf")        # largest move in the last step
@@ -375,31 +464,64 @@ class Cloth(object):
             P[ia] += wa * corr
             P[ib] -= wb * corr
 
-    def _self_collide(self, thickness, free):
-        """Keeps folds `thickness` apart: points in the same row that are far
-        apart along the fabric but close in space push each other away."""
-        if thickness <= 0:
+    def _self_pairs(self, thickness):
+        """Finds the parts of the fabric that could touch each other this
+        step: pairs of sub-grid points (spaced about thickness / 2) that are
+        close in space but far apart along the fabric."""
+        s_ = max(1, int(round(0.5 * thickness / min(self.du, self.dv))))
+        ii, jj = grid_indices(self.nu, s_), grid_indices(self.nv, s_)
+        X = self.P[:, ii][:, :, jj].reshape(3, -1).T
+        I, J = close_pairs(X, 1.35 * thickness)        # a bit wider: reused
+        b = len(jj)
+        gi, gj = divmod(I, b)
+        hi_, hj = divmod(J, b)
+        along = np.hypot((ii[gi] - ii[hi_]) * self.du, (jj[gj] - jj[hj]) * self.dv)
+        keep = along > 1.5 * thickness
+        return ii, jj, I[keep], J[keep]
+
+    def _spread(self, ii, n):
+        """(n, len(ii)) matrix that spreads values at indices ii smoothly
+        (linear) over all n indices."""
+        key = (tuple(ii), n)
+        cache = self.__dict__.setdefault("_spread_cache", {})
+        if key not in cache:
+            M = np.zeros((n, len(ii)))
+            for k in range(len(ii) - 1):
+                a, b = ii[k], ii[k + 1]
+                t = (np.arange(a, b + 1) - a) / float(b - a)
+                M[a:b + 1, k] = np.maximum(M[a:b + 1, k], 1.0 - t)
+                M[a:b + 1, k + 1] = np.maximum(M[a:b + 1, k + 1], t)
+            cache[key] = M
+        return cache[key]
+
+    def _self_push(self, pairs, thickness, free, omega=1.5):
+        """Thick fabric can't pass through itself: the pairs closer than
+        `thickness` are pushed apart. Each push moves the whole patch of
+        fabric around the sub-grid point (spread smoothly), so the springs
+        don't simply pull it back. This is what makes falling fabric stack
+        up in layers of rounded ridges instead of flattening."""
+        ii, jj, I, J = pairs
+        if I.size == 0:
             return
-        P = self.P
-        m0 = max(2, int(math.ceil(1.7 * thickness / self.du)))
-        m1 = min(self.nu - 1, m0 + min(30, max(4, int(math.ceil(4 * thickness / self.du)))))
-        if m0 > m1:
+        a, b = len(ii), len(jj)
+        X = self.P[:, ii][:, :, jj].reshape(3, -1).T
+        d = X[J] - X[I]
+        L = np.linalg.norm(d, axis=1)
+        m = L < thickness
+        if not m.any():
             return
-        delta = np.zeros_like(P)
-        count = np.zeros_like(self.W)
-        f = free.astype(float)
-        for m in range(m0, m1 + 1):
-            d = P[:, m:] - P[:, :-m]
-            L = _length(d)
-            close = (L < thickness) & ((f[:, m:] + f[:, :-m]) > 0)
-            if not close.any():
-                continue
-            corr = np.where(close, d * ((thickness - L) / np.maximum(L, 1e-12) * 0.5), 0.0)
-            delta[:, m:] += corr * f[:, m:]
-            delta[:, :-m] -= corr * f[:, :-m]
-            count[:, m:] += close
-            count[:, :-m] += close
-        P += delta / np.maximum(count, 1.0)
+        I, J, d, L = I[m], J[m], d[m], L[m]
+        corr = d * (0.5 * (thickness - L) / np.maximum(L, 1e-12))[:, None]
+        delta = np.zeros((a * b, 3))
+        count = np.zeros(a * b)
+        np.add.at(delta, I, -corr)
+        np.add.at(delta, J, corr)
+        np.add.at(count, I, 1.0)
+        np.add.at(count, J, 1.0)
+        delta *= (omega / np.maximum(count, 1.0))[:, None]
+        Mi, Mj = self._spread(ii, self.nu), self._spread(jj, self.nv)
+        for c_ in range(3):
+            self.P[c_] += (Mi @ delta[:, c_].reshape(a, b) @ Mj.T) * self.W[0]
 
     def step(self, n, accel, stiffness, bend, fabric=0.0, gap=0.0, floor_z=None,
              collide=None, damping=0.98, passes=3, max_speed=None, grabs=(),
@@ -429,31 +551,40 @@ class Cloth(object):
             P[:, gi, gj] = target
         free = W > 0
         shares = self._shares()           # W is fixed during this call
-        # friction grips with the fabric's weight: the push depth it counts is
-        # capped at 2 steps of gravity, so spring forces pulling the cloth
-        # around an edge don't weld it in place (which would tear it)
-        depth_cap = 2.0 * float(np.linalg.norm(accel)) + 1e-12
+        thick = fabric > 0
+        # friction grips with the fabric's weight (one step of gravity), like
+        # real friction: resting fabric sticks, but strong spring pulls (cloth
+        # dragged around an edge) still win, so it never welds and tears
+        depth_cap = float(np.linalg.norm(accel)) + 1e-12
+        band = 0.1 * self.dv                  # resting points count as touching
 
         def contacts(mu):
             if floor_z is not None:
                 fz = floor_z + gap
-                low = ((P[2] < fz) & free[0]).reshape(-1)
+                low = ((P[2] < fz + band) & free[0]).reshape(-1)
                 if low.any():
                     X, V = P.reshape(3, -1), self.prev.reshape(3, -1)
                     idx = np.nonzero(low)[0]
-                    depth = fz - X[2, idx]
-                    X[2, idx] = fz
-                    nz = np.tile([0.0, 0.0, 1.0], (idx.size, 1))
-                    V[:, idx] = contact_friction(X[:, idx].T, V[:, idx].T, nz,
-                                                 np.minimum(depth, depth_cap), mu).T
+                    X[2, idx] = np.maximum(X[2, idx], fz)
+                    if mu > 0:
+                        nz = np.tile([0.0, 0.0, 1.0], (idx.size, 1))
+                        Xn, Vn = contact_friction(X[:, idx].T, V[:, idx].T, nz, depth_cap, mu)
+                        X[:, idx], V[:, idx] = Xn.T, Vn.T
             if collide is not None:
                 if hasattr(collide, "friction"):
                     collide.friction = mu
                     collide.depth_cap = depth_cap
+                    collide.band = band
                 collide(P, self.prev, free, gap)
 
         try:
             for it in range(n):
+                if self.lift > 0:
+                    # lowering the rail edge (start 3), half a spacing per step
+                    self.lift = max(0.0, self.lift - 0.5 * self.dv)
+                    P[:, :, 0] = self.top_rest
+                    P[2, :, 0] += self.lift
+                    self.prev[:, :, 0] = P[:, :, 0]
                 before = P.copy()
                 vel = (P - self.prev) * damping + accel
                 if max_speed:
@@ -467,6 +598,11 @@ class Cloth(object):
                 # brakes the motion, so the springs below can still pull the
                 # fabric into shape (wrinkles) where it rests on something
                 contacts(friction)
+                if thick and (self.age % 2 == 0 or getattr(self, "_pairs", None) is None
+                              or self._pairs[0] != fabric):
+                    # the search is the expensive part: redo it every 2 steps
+                    self._pairs = (fabric, self._self_pairs(fabric))
+                pairs = self._pairs[1] if thick else None
                 for _ in range(passes):
                     for sa, sb, rest, kind, fa, fb in shares:
                         self._project(sa, sb, rest, k_of[kind][0], k_of[kind][1], fa, fb)
@@ -474,12 +610,12 @@ class Cloth(object):
                         self._bend(2, bend)             # smooths small creases
                         if span > 2:
                             self._bend(span, bend, fade)    # big, thick folds
+                    if thick:
+                        self._self_push(pairs, fabric, free)
                 reach = 4
                 while reach < max(self.nu, self.nv):
                     self._limit(reach)
                     reach *= 4
-                if fabric > 0:
-                    self._self_collide(fabric, free)
                 # tethers: no point gets further from its top point than the
                 # fabric length between them (stops rubbery stretching)
                 if self.pinned:
@@ -488,7 +624,8 @@ class Cloth(object):
                     over = (L > self.tether) & free
                     if over.any():
                         P[:] = np.where(over, P[:, :, :1] + d * (self.tether / np.maximum(L, 1e-12)), P)
-                contacts(0.0)            # and once more so nothing ends up inside
+                contacts(friction)       # and once more: nothing inside, resting
+                                         # fabric doesn't slide (static friction)
                 self.total += 1
                 self.age += 1
                 self.motion = float(np.abs(P - before).max())
@@ -539,13 +676,6 @@ class Cloth(object):
             return None
         return divmod(k, self.nv)
 
-
-def grid_indices(n, stride):
-    """Every stride-th index, always including the last one."""
-    idx = list(range(0, n, stride))
-    if idx[-1] != n - 1:
-        idx.append(n - 1)
-    return np.array(idx)
 
 # ----------------------------------------------------------------------------
 # grasshopper
@@ -635,7 +765,7 @@ def rigid_fit(A, B):
     return R, t, float(np.abs(A @ R.T + t - B).max())
 
 
-def _signed_push(cmesh, X, V, k, gap, friction=0.8, depth_cap=np.inf):
+def _signed_push(cmesh, X, V, k, gap, friction=0.8, depth_cap=0.0, band=0.0):
     """Pushes point k of X (3, N) out of the mesh to `gap`. Returns distance."""
     x, y, z = X[0, k], X[1, k], X[2, k]
     mp = cmesh.ClosestMeshPoint(rg.Point3d(x, y, z), 0.0)
@@ -645,12 +775,13 @@ def _signed_push(cmesh, X, V, k, gap, friction=0.8, depth_cap=np.inf):
     n = cmesh.NormalAt(mp)
     n.Unitize()
     dist = (x - cp.X) * n.X + (y - cp.Y) * n.Y + (z - cp.Z) * n.Z
-    if dist < gap:
+    if dist < gap + band:
         nv = np.array([n.X, n.Y, n.Z])
-        depth = gap - dist
-        X[:, k] += nv * depth                          # push out along the normal
-        V[:, k] = contact_friction(X[:, k][None], V[:, k][None], nv[None],
-                                   np.array([min(depth, depth_cap)]), friction)[0]
+        X[:, k] += nv * max(gap - dist, 0.0)           # push out along the normal
+        if friction > 0:
+            Xn, Vn = contact_friction(X[:, k][None], V[:, k][None], nv[None],
+                                      depth_cap, friction)
+            X[:, k], V[:, k] = Xn[0], Vn[0]
     return dist
 
 
@@ -679,10 +810,12 @@ def _make_direct(cmesh, reach, refresh=8):
             state["near"] = np.array(near, int)
         for k in state["near"]:
             if fr[k]:
-                _signed_push(cmesh, X, V, k, gap, collide.friction, collide.depth_cap)
+                _signed_push(cmesh, X, V, k, gap, collide.friction, collide.depth_cap,
+                             collide.band)
         state["count"] += 1
     collide.friction = 0.8               # set every step from the input
-    collide.depth_cap = np.inf
+    collide.depth_cap = 0.0
+    collide.band = 0.0
     return collide
 
 
@@ -998,6 +1131,7 @@ def run_grasshopper():
     stiffness = float(_val("stiffness", 1.0))
     bend = float(_val("bend", 0.1))
     friction = max(0.0, float(_val("friction", 0.8)))
+    drag = min(0.5, max(0.0, float(_val("drag", 0.02))))
     compression = min(1.0, max(0.0, float(_val("compression", 0.2))))
     floor_z = _val("floor_z", None)
     gap = max(0.0, float(_val("thickness", drop / 80.0)))
@@ -1064,7 +1198,7 @@ def run_grasshopper():
     # points from jumping through thin colliders between checks
     max_speed = reach_step
 
-    phys_key = (accel, stiffness, bend, floor_z, gap, ckey, friction, compression)
+    phys_key = (accel, stiffness, bend, floor_z, gap, ckey, friction, compression, drag)
     if st.get("phys_key") != phys_key:
         st["phys_key"] = phys_key
         cloth.total = 0
@@ -1111,7 +1245,9 @@ def run_grasshopper():
     max_it = max(1, int(_val("iterations", 1000)))
 
     def is_settled():
-        return held is None and (cloth.total >= max_it or cloth.motion < 1e-4 * cloth.dv)
+        if held is not None or cloth.lift > 0:     # grabbed, or still lowering
+            return False
+        return cloth.total >= max_it or cloth.motion < 1e-4 * cloth.dv
 
     settled = is_settled()
     t0 = time.time()
@@ -1119,7 +1255,7 @@ def run_grasshopper():
         cloth.step(max(1, int(_val("steps", 5))), accel, stiffness, bend,
                    fabric=fabric, gap=gap, floor_z=floor_z, collide=collide,
                    max_speed=max_speed, grabs=grabs,
-                   compression=compression, friction=friction)
+                   compression=compression, friction=friction, damping=1.0 - drag)
         settled = is_settled()
     ms = (time.time() - t0) * 1000.0
 
