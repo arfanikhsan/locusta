@@ -403,6 +403,10 @@ def _surfaces(geos):
         if isinstance(g, rg.BrepFace):
             g = g.DuplicateFace(False)
         if isinstance(g, rg.Brep):
+            g = g.DuplicateBrep()
+            # Boundary Surfaces / PlanarSrf make a rectangle as a trimmed,
+            # oversized plane: shrinking fits it to its edges -> untrimmed
+            g.Faces.ShrinkFaces()
             for f in g.Faces:
                 if f.IsSurface:
                     out.append((f.UnderlyingSurface(), f.OrientationIsReversed))
