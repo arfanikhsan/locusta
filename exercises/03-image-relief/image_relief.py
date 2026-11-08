@@ -374,6 +374,7 @@ try:
 except ImportError:
     IN_RHINO = False
 
+DIAG = {}                  # which fast paths worked, and why not (for `info`)
 MAX_PX = 2048              # bigger images are scaled down (enough for any mesh)
 MAX_VERTS = 1500000
 
@@ -535,9 +536,13 @@ def _evaluate(srf, nu, nv, closed_u, closed_v):
     vs = np.linspace(dv.T0, dv.T1, nv, endpoint=not closed_v)
     try:
         fast = _evaluate_fast(srf, us, vs)
-    except Exception:
+        if fast is None:
+            DIAG["surface"] = "slow (NumPy didn't match Rhino)"
+    except Exception as e:
         fast = None
+        DIAG["surface"] = "slow (fast path error: {}: {})".format(type(e).__name__, str(e)[:120])
     if fast is not None:
+        DIAG["surface"] = "fast"
         return fast
     P = np.zeros((nv, nu, 3))
     N = np.zeros((nv, nu, 3))
@@ -569,7 +574,8 @@ def _net_array(net_type, n, data):
     import base64
     import System
     from System.Runtime.InteropServices import Marshal, GCHandle, GCHandleType
-    arr = System.Array.CreateInstance(net_type, n)
+    import clr
+    arr = System.Array.CreateInstance(clr.GetClrType(net_type), n)
     src = System.Convert.FromBase64String(base64.b64encode(data.tobytes()).decode("ascii"))
     h = GCHandle.Alloc(arr, GCHandleType.Pinned)
     try:
@@ -588,14 +594,19 @@ def _fast_mesh(V, F):
         m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
         k = len(V) // 2
         p, f = m.Vertices[k], m.Faces[len(F) - 1]
-        if (m.Vertices.Count != len(V) or m.Faces.Count != len(F)
-                or abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max())
+        if m.Vertices.Count != len(V) or m.Faces.Count != len(F):
+            DIAG["mesh"] = "slow (fast path gave {} / {} vertices)".format(m.Vertices.Count, len(V))
+            return None
+        if (abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max())
                 or (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1])):
+            DIAG["mesh"] = "slow (fast path data mismatch)"
             return None
         m.Normals.ComputeNormals()
         m.FaceNormals.ComputeFaceNormals()
+        DIAG["mesh"] = "fast"
         return m
-    except Exception:
+    except Exception as e:
+        DIAG["mesh"] = "slow (fast path error: {}: {})".format(type(e).__name__, str(e)[:120])
         return None
 
 
@@ -629,6 +640,7 @@ def run_grasshopper():
     store = sc.sticky.setdefault("image_relief", {})
     st = store.setdefault(str(comp.InstanceGuid), {})
     t0 = time.time()
+    DIAG.clear()
 
     path = _val("image", None)
     if not path:
@@ -752,7 +764,16 @@ def run_grasshopper():
         txt += " | heights: connect it to get values"
     if skipped:
         txt += " | skipped {} trimmed / unsupported face(s)".format(skipped)
-    comp.Message = "{} vertices".format(sum(m.Vertices.Count for m in out_m))
+    bad = [m for m in out_m if not m.IsValid]
+    if bad:
+        ok, log = bad[0].IsValidWithLog()
+        txt += " | INVALID MESH: " + str(log).strip().replace("\n", " ")[:300]
+    names = [o.NickName for o in comp.Params.Output]
+    for need in ("mesh", "heights", "info"):
+        if need not in names:
+            txt += " | WARNING: no output named '{}' (outputs are: {})".format(need, ", ".join(names))
+    txt += " | paths: surface {}, mesh {}".format(DIAG.get("surface", "cached"), DIAG.get("mesh", "-"))
+    comp.Message = "{} vertices, {:.0f} ms".format(sum(m.Vertices.Count for m in out_m), ms)
     return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
 
 
