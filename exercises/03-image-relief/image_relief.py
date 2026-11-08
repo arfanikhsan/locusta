@@ -585,29 +585,59 @@ def _net_array(net_type, n, data):
     return arr
 
 
+def _check_mesh(m, V, F, how):
+    """True if the Rhino mesh holds exactly V and F."""
+    if m.Vertices.Count != len(V) or m.Faces.Count != len(F):
+        DIAG["mesh_" + how] = "gave {} / {} vertices".format(m.Vertices.Count, len(V))
+        return False
+    for k in (0, len(V) // 2, len(V) - 1):
+        p = m.Vertices[k]
+        if abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max()):
+            DIAG["mesh_" + how] = "vertex mismatch"
+            return False
+    f = m.Faces[len(F) - 1]
+    if (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1]):
+        DIAG["mesh_" + how] = "face mismatch"
+        return False
+    return True
+
+
+def _mesh_by_copy(V, F):
+    """Fastest: copy the raw bytes into .NET Point3f / MeshFace arrays."""
+    m = rg.Mesh()
+    m.Vertices.AddVertices(_net_array(rg.Point3f, len(V), np.ascontiguousarray(V, np.float32)))
+    m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
+    return m
+
+
+def _mesh_by_list(V, F):
+    """Fast enough: make the structs in Python, hand them over in one call
+    each (the slow part of the old way was one Rhino call per vertex)."""
+    import System
+    P3f, MF = rg.Point3f, rg.MeshFace
+    pts = System.Array[P3f]([P3f(x, y, z) for x, y, z in V.tolist()])
+    fcs = System.Array[MF]([MF(a, b, c, d) for a, b, c, d in F.tolist()])
+    m = rg.Mesh()
+    m.Vertices.AddVertices(pts)
+    m.Faces.AddFaces(fcs)
+    return m
+
+
 def _fast_mesh(V, F):
-    """Whole mesh in a few calls: Point3f is 3 floats, MeshFace 4 ints
-    (a triangle repeats its last index, like our face array)."""
-    try:
-        m = rg.Mesh()
-        m.Vertices.AddVertices(_net_array(rg.Point3f, len(V), np.ascontiguousarray(V, np.float32)))
-        m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
-        k = len(V) // 2
-        p, f = m.Vertices[k], m.Faces[len(F) - 1]
-        if m.Vertices.Count != len(V) or m.Faces.Count != len(F):
-            DIAG["mesh"] = "slow (fast path gave {} / {} vertices)".format(m.Vertices.Count, len(V))
-            return None
-        if (abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max())
-                or (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1])):
-            DIAG["mesh"] = "slow (fast path data mismatch)"
-            return None
-        m.Normals.ComputeNormals()
-        m.FaceNormals.ComputeFaceNormals()
-        DIAG["mesh"] = "fast"
-        return m
-    except Exception as e:
-        DIAG["mesh"] = "slow (fast path error: {}: {})".format(type(e).__name__, str(e)[:120])
-        return None
+    """Tries the fast ways in turn; each result is checked against V and F.
+    A triangle repeats its last index, which is also Rhino's convention."""
+    for how, build in (("copy", _mesh_by_copy), ("list", _mesh_by_list)):
+        try:
+            m = build(V, F)
+            if _check_mesh(m, V, F, how):
+                m.Normals.ComputeNormals()
+                m.FaceNormals.ComputeFaceNormals()
+                DIAG["mesh"] = how
+                return m
+        except Exception as e:
+            DIAG["mesh_" + how] = "{}: {}".format(type(e).__name__, str(e)[:100])
+    DIAG["mesh"] = "slow (one vertex at a time)"
+    return None
 
 
 def _to_rhino_mesh(V, F, cache, key):
@@ -773,6 +803,9 @@ def run_grasshopper():
         if need not in names:
             txt += " | WARNING: no output named '{}' (outputs are: {})".format(need, ", ".join(names))
     txt += " | paths: surface {}, mesh {}".format(DIAG.get("surface", "cached"), DIAG.get("mesh", "-"))
+    errs = ["{} failed ({})".format(k[5:], v) for k, v in sorted(DIAG.items()) if k.startswith("mesh_")]
+    if errs:
+        txt += " | " + "; ".join(errs)
     comp.Message = "{} vertices, {:.0f} ms".format(sum(m.Vertices.Count for m in out_m), ms)
     return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
 
