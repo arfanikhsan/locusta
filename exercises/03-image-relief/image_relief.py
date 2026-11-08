@@ -602,11 +602,33 @@ def _check_mesh(m, V, F, how):
     return True
 
 
+def _add_all(method, arr, T):
+    """Calls Mesh.Vertices.AddVertices / Mesh.Faces.AddFaces with a .NET
+    array. Python.NET can pick the wrong overload (Point3d vs Point3f), so
+    the IEnumerable<T> version is asked for explicitly in a few ways."""
+    from System.Collections.Generic import IEnumerable, List
+    tries = (lambda: method.Overloads[IEnumerable[T]](arr),
+             lambda: method(IEnumerable[T](arr)),
+             lambda: method(List[T](arr)),
+             lambda: method(arr))
+    err = None
+    for k, call in enumerate(tries):
+        try:
+            call()
+            return k
+        except Exception as e:
+            err = e
+    raise err
+
+
 def _mesh_by_copy(V, F):
-    """Fastest: copy the raw bytes into .NET Point3f / MeshFace arrays."""
+    """Fastest: copy the raw bytes into .NET Point3d / MeshFace arrays
+    (Point3d is 3 doubles, MeshFace 4 ints)."""
     m = rg.Mesh()
-    m.Vertices.AddVertices(_net_array(rg.Point3f, len(V), np.ascontiguousarray(V, np.float32)))
-    m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
+    _add_all(m.Vertices.AddVertices,
+             _net_array(rg.Point3d, len(V), np.ascontiguousarray(V, np.float64)), rg.Point3d)
+    _add_all(m.Faces.AddFaces,
+             _net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)), rg.MeshFace)
     return m
 
 
@@ -614,12 +636,12 @@ def _mesh_by_list(V, F):
     """Fast enough: make the structs in Python, hand them over in one call
     each (the slow part of the old way was one Rhino call per vertex)."""
     import System
-    P3f, MF = rg.Point3f, rg.MeshFace
-    pts = System.Array[P3f]([P3f(x, y, z) for x, y, z in V.tolist()])
+    P3d, MF = rg.Point3d, rg.MeshFace
+    pts = System.Array[P3d]([P3d(x, y, z) for x, y, z in V.tolist()])
     fcs = System.Array[MF]([MF(a, b, c, d) for a, b, c, d in F.tolist()])
     m = rg.Mesh()
-    m.Vertices.AddVertices(pts)
-    m.Faces.AddFaces(fcs)
+    _add_all(m.Vertices.AddVertices, pts, P3d)
+    _add_all(m.Faces.AddFaces, fcs, MF)
     return m
 
 
