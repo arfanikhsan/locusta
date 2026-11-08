@@ -828,6 +828,11 @@ def run_grasshopper():
     errs = ["{} failed ({})".format(k[5:], v) for k, v in sorted(DIAG.items()) if k.startswith("mesh_")]
     if errs:
         txt += " | " + "; ".join(errs)
+    for m in out_m[:1]:
+        b = m.GetBoundingBox(False)
+        txt += " | mesh out: {} V{} F{} valid={} closed={} box {:.0f}x{:.0f}x{:.0f} at ({:.0f}, {:.0f}, {:.0f})".format(
+            type(m).__name__, m.Vertices.Count, m.Faces.Count, m.IsValid, m.IsClosed,
+            b.Max.X - b.Min.X, b.Max.Y - b.Min.Y, b.Max.Z - b.Min.Z, b.Min.X, b.Min.Y, b.Min.Z)
     comp.Message = "{} vertices, {:.0f} ms".format(sum(m.Vertices.Count for m in out_m), ms)
     return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
 
