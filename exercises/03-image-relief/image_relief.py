@@ -374,6 +374,7 @@ try:
 except ImportError:
     IN_RHINO = False
 
+VERSION = "v6"             # shown first in `info`, so you can see which script runs
 DIAG = {}                  # which fast paths worked, and why not (for `info`)
 MAX_PX = 2048              # bigger images are scaled down (enough for any mesh)
 MAX_VERTS = 1500000
@@ -808,7 +809,7 @@ def run_grasshopper():
             meshes.pop(k)
 
     ms = (time.time() - t0) * 1000.0
-    txt = ("image {}x{} ({}) | {} | {:.0f} ms (image {:.0f}, surface {:.0f}, "
+    txt = (VERSION + " | image {}x{} ({}) | {} | {:.0f} ms (image {:.0f}, surface {:.0f}, "
            "relief {:.0f}, mesh {:.0f})").format(
         H0.shape[1], H0.shape[0], st.get("img_by"), " ; ".join(notes), ms,
         (t_img - t0) * 1000, t_srf * 1000, t_rel * 1000, t_mesh * 1000)
@@ -834,7 +835,15 @@ def run_grasshopper():
             type(m).__name__, m.Vertices.Count, m.Faces.Count, m.IsValid, m.IsClosed,
             b.Max.X - b.Min.X, b.Max.Y - b.Min.Y, b.Max.Z - b.Min.Z, b.Min.X, b.Min.Y, b.Min.Z)
     comp.Message = "{} vertices, {:.0f} ms".format(sum(m.Vertices.Count for m in out_m), ms)
-    return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
+    # Hand Grasshopper ready-made GH_Mesh objects, so it doesn't have to
+    # convert the Python result itself
+    try:
+        import Grasshopper
+        out_g = [Grasshopper.Kernel.Types.GH_Mesh(m) for m in out_m]
+    except Exception as e:
+        out_g = out_m
+        txt += " | GH_Mesh wrap failed: {}".format(e)
+    return (out_g[0] if len(out_g) == 1 else out_g), (out_h or None), txt
 
 
 if IN_RHINO:
