@@ -89,7 +89,7 @@ def _box(a, r, axis, mode):
     return (hi - lo) / (2 * r + 1)
 
 
-def blur(a, sigma_x, sigma_y=None, mode="repeat"):
+def smooth_image(a, sigma_x, sigma_y=None, mode="repeat"):
     """Gaussian-like blur (3 box passes), sigmas in pixels."""
     if sigma_y is None:
         sigma_y = sigma_x
@@ -285,7 +285,7 @@ def relief(P, N, H, depth, rep_u, rep_v, closed_u, closed_v, mode="repeat",
         nv, nu = P.shape[:2]
         sx = H.shape[1] * rep_u / max(nu - 1, 1)
         sy = H.shape[0] * rep_v / max(nv - 1, 1)
-        H = blur(H, 0.5 * sx if sx > 1 else 0, 0.5 * sy if sy > 1 else 0, mode)
+        H = smooth_image(H, 0.5 * sx if sx > 1 else 0, 0.5 * sy if sy > 1 else 0, mode)
     h = sample(H, TU, TV, mode)
     if gamma != 1.0:
         h = np.clip(h, 0.0, 1.0) ** gamma
@@ -320,8 +320,12 @@ MAX_VERTS = 1500000
 
 
 def _val(name, default):
+    """A component input, or `default` when it's missing or not connected.
+    (Functions and modules are skipped, in case a name ever clashes.)"""
     v = globals().get(name)
-    return default if v is None else v
+    if v is None or callable(v) or type(v).__name__ == "module":
+        return default
+    return v
 
 
 def load_image(path):
@@ -484,7 +488,7 @@ def run_grasshopper():
     mode = "mirror" if mirror else "repeat"
     proc_key = (st["img_key"], blur_px, invert, mode)
     if st.get("proc_key") != proc_key:
-        H = normalize(blur(H0, blur_px, blur_px, mode))
+        H = normalize(smooth_image(H0, blur_px, blur_px, mode))
         st["H"] = 1.0 - H if invert else H
         st["proc_key"] = proc_key
     H = st["H"]
