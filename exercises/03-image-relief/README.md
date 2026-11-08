@@ -61,6 +61,22 @@ displacement map that only shows up in a render. You can bake it, section it,
 5. To render it smooth, connect `mesh` to a **Mesh** param and bake, or
    colour it with `heights` → `Gradient` → `Mesh Colours` for a quick check.
 
+## Flat panel
+1. Make a flat surface: the **Plane Surface** component, or `Rectangle` →
+   `Boundary Surfaces`, or in Rhino `Plane` / `Srf4Pt` and set it in a Surface param.
+2. Connect it to `base`. Image left→right follows the surface's u direction;
+   if the image is rotated, toggle `swap`.
+3. Leave `tile_size` at 0 to fit the image once, or set it to repeat the
+   pattern at a real size (e.g. 50 = one image per 50 units). Turn on `mirror`
+   if the repeats show seams.
+4. The relief goes to the side the surface normal faces. Wrong side? Toggle `flip`.
+5. `thickness` > 0 turns the panel into a closed solid slab (flat back, relief
+   front), ready to 3D print or mill. `fade` flattens the relief near the
+   panel's edges so neighbouring panels line up.
+
+Trimmed shapes (a circle or an L-shaped surface) are skipped: only rectangular
+faces are textured. Use a rectangle and trim the mesh afterwards.
+
 ## Which images work
 The script reads **brightness as height**: white = high, black = low.
 - **A height map works best** (a grayscale image where brightness really is height),
