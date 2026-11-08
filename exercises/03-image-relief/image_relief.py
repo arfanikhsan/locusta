@@ -374,7 +374,7 @@ try:
 except ImportError:
     IN_RHINO = False
 
-VERSION = "v6"             # shown first in `info`, so you can see which script runs
+VERSION = "v7"             # shown first in `info`, so you can see which script runs
 DIAG = {}                  # which fast paths worked, and why not (for `info`)
 MAX_PX = 2048              # bigger images are scaled down (enough for any mesh)
 MAX_VERTS = 1500000
@@ -694,6 +694,14 @@ def run_grasshopper():
     st = store.setdefault(str(comp.InstanceGuid), {})
     t0 = time.time()
     DIAG.clear()
+    # what Grasshopper stored in the outputs after the previous run
+    try:
+        prev = ", ".join("{}={}{}".format(o.NickName, o.VolatileDataCount,
+                         "" if o.VolatileDataCount == 0 else
+                         " " + type(o.VolatileData.AllData(True).__iter__().__next__()).__name__)
+                         for o in comp.Params.Output)
+    except Exception as e:
+        prev = "unknown ({})".format(e)
 
     path = _val("image", None)
     if not path:
@@ -829,6 +837,11 @@ def run_grasshopper():
     errs = ["{} failed ({})".format(k[5:], v) for k, v in sorted(DIAG.items()) if k.startswith("mesh_")]
     if errs:
         txt += " | " + "; ".join(errs)
+    txt += " | previous run stored: " + prev
+    out_param = [o for o in comp.Params.Output if o.NickName == "mesh"]
+    if out_param:
+        o = out_param[0]
+        txt += " | mesh output type: {} ({})".format(type(o).__name__, o.TypeName)
     for m in out_m[:1]:
         b = m.GetBoundingBox(False)
         txt += " | mesh out: {} V{} F{} valid={} closed={} box {:.0f}x{:.0f}x{:.0f} at ({:.0f}, {:.0f}, {:.0f})".format(
