@@ -105,15 +105,30 @@ The script reads **brightness as height**: white = high, black = low.
 
 ## How it works
 1. Load the image → grayscale (0.299 R + 0.587 G + 0.114 B) → blur → stretch to 0–1.
-2. Sample the base surface on a grid (`detail`): points and normals. This is
-   the only slow part (Rhino calls), so it's cached: changing `depth`, `blur`,
-   the image etc. is fast. Only a new surface or `detail` makes it sample again.
+2. Sample the base surface on a grid (`detail`): points and normals. NURBS
+   surfaces are evaluated in one go with NumPy (checked against Rhino at a few
+   points; anything else falls back to asking Rhino point by point). The result is
+   cached, so only a new surface or `detail` samples again.
+   The image is scaled down to about 2 pixels per vertex, so it can't alias and
+   stays quick to process.
 3. For each vertex, measure its distance along the surface in u and v →
    texture coordinates → bilinear lookup in the image (repeat or mirror tiling).
 4. Move each vertex: `P + N · depth · height`, times the edge fade.
 5. Build the quad mesh. Closed directions are welded, `thickness` adds an
    offset back surface and side walls, and `cap` adds a centre fan at each end.
    The mesh faces point the same way as the relief.
+
+## Speed
+The `info` panel ends with a time breakdown: `image`, `surface`, `relief`, `mesh`.
+- Moving `depth`, `tile_size`, `gamma`, `fade`, `offset` or `thickness` only redoes the
+  relief and the mesh (should be well under a second).
+- `blur`, `invert`, `mirror`, `swap` also redo the image once (small, cached).
+- A new `base` surface or `detail` re-measures the surface. NURBS surfaces
+  are evaluated all at once with NumPy, so that's fast too.
+- `heights` is only filled when something is connected to it (sending
+  hundreds of thousands of numbers to Grasshopper is slow).
+- Set it up at `detail` 150–250, then raise it for the final mesh.
+- If one step is still slow, send me the `info` text.
 
 ## Limits
 - Displacement goes along the normal, so it can't make overhangs or undercuts

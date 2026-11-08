@@ -114,6 +114,65 @@ def normalize(h, clip=0.5):
     return np.clip((h - lo) / (hi - lo), 0.0, 1.0)
 
 
+def downsample(H, w, h):
+    """Area-average H down to at most (h, w) pixels. Cheap anti-aliasing:
+    the mesh never needs more than about 2 pixels per vertex."""
+    hh, ww = H.shape
+    w, h = int(min(max(w, 2), ww)), int(min(max(h, 2), hh))
+    if w < ww:
+        e = np.linspace(0, ww, w + 1).astype(int)
+        H = np.add.reduceat(H, e[:-1], axis=1) / np.diff(e)
+    if h < hh:
+        e = np.linspace(0, hh, h + 1).astype(int)
+        H = np.add.reduceat(H, e[:-1], axis=0) / np.diff(e)[:, None]
+    return H
+
+
+def bspline_basis(knots, p, t):
+    """B-spline basis functions of degree p and their first derivatives at
+    the parameters t, as dense (len(t), n_cv) arrays. `knots` is the full
+    knot vector (n_cv + p + 1 values)."""
+    k = np.asarray(knots, float)
+    t = np.asarray(t, float)
+    n_cv = len(k) - p - 1
+    span = np.clip(np.searchsorted(k, t, side="right") - 1, p, n_cv - 1)
+    N = np.zeros((len(t), len(k) - 1))
+    N[np.arange(len(t)), span] = 1.0
+    T = t[:, None]
+    dN = np.zeros((len(t), n_cv))
+    for d in range(1, p + 1):
+        d1 = k[d:-1] - k[:-d - 1]
+        d2 = k[d + 1:] - k[1:-d]
+        s1 = np.where(d1 > 0, d1, 1.0)
+        s2 = np.where(d2 > 0, d2, 1.0)
+        if d == p:
+            dN = d * (np.where(d1 > 0, N[:, :-1] / s1, 0.0)
+                      - np.where(d2 > 0, N[:, 1:] / s2, 0.0))
+        a = np.where(d1 > 0, (T - k[:-d - 1]) / s1, 0.0)
+        b = np.where(d2 > 0, (k[d + 1:] - T) / s2, 0.0)
+        N = a * N[:, :-1] + b * N[:, 1:]
+    return N, dN
+
+
+def nurbs_grid(C, W, ku, kv, pu, pv, us, vs):
+    """Points and unnormalised normals (Su x Sv) of a NURBS surface on the
+    grid us x vs, all at once. C (cu, cv, 3) control points, W (cu, cv)
+    weights. Returns (nv, nu, 3) arrays."""
+    Bu, dBu = bspline_basis(ku, pu, us)
+    Bv, dBv = bspline_basis(kv, pv, vs)
+    Cw = C * W[..., None]
+
+    def ev(bv, bu, X):                      # (nv, nu) for each coordinate
+        return np.einsum("jb,abc,ia->jic", bv, X, bu, optimize=True)
+    A, w = ev(Bv, Bu, Cw), ev(Bv, Bu, W[..., None])
+    Au, wu = ev(Bv, dBu, Cw), ev(Bv, dBu, W[..., None])
+    Av, wv = ev(dBv, Bu, Cw), ev(dBv, Bu, W[..., None])
+    P = A / w
+    Su = (Au - wu * P) / w
+    Sv = (Av - wv * P) / w
+    return P, np.cross(Su, Sv)
+
+
 def _wrap(t, mode):
     """Texture coordinate (any real number, 1 = one image) -> 0..1."""
     if mode == "repeat":
@@ -277,7 +336,7 @@ def build_mesh(front, closed_u, closed_v, back=None, cap=False):
 
 
 def relief(P, N, H, depth, rep_u, rep_v, closed_u, closed_v, mode="repeat",
-           off_u=0.0, off_v=0.0, fade=0.0, gamma=1.0, aa=True):
+           off_u=0.0, off_v=0.0, fade=0.0, gamma=1.0, aa=False):
     """Moves the base grid P (nv, nu, 3) along its normals N by the image H.
     Returns (displaced points, heights 0-1)."""
     TU, TV, cu, tu, cv, tv = tex_coords(P, closed_u, closed_v, rep_u, rep_v, off_u, off_v)
@@ -424,11 +483,62 @@ def _default_base():
     return rg.Cylinder(c, 300.0).ToNurbsSurface()
 
 
+def _nurbs_arrays(ns):
+    """Control points, weights and full knot vectors of a NurbsSurface."""
+    cu, cv = ns.Points.CountU, ns.Points.CountV
+    C = np.zeros((cu, cv, 3))
+    W = np.ones((cu, cv))
+    for i in range(cu):
+        for j in range(cv):
+            cp = ns.Points.GetControlPoint(i, j)
+            p = cp.Location
+            C[i, j] = (p.X, p.Y, p.Z)
+            W[i, j] = cp.Weight
+    ku = [ns.KnotsU[i] for i in range(ns.KnotsU.Count)]
+    kv = [ns.KnotsV[i] for i in range(ns.KnotsV.Count)]
+    # Rhino leaves out the first and last knot (they never matter)
+    ku = np.array([ku[0]] + ku + [ku[-1]])
+    kv = np.array([kv[0]] + kv + [kv[-1]])
+    return C, W, ku, kv, ns.OrderU - 1, ns.OrderV - 1
+
+
+def _evaluate_fast(srf, us, vs):
+    """The whole grid in one go with NumPy, checked against Rhino at a few
+    points. Returns None if anything doesn't match (then use Rhino)."""
+    ns = srf if isinstance(srf, rg.NurbsSurface) else srf.ToNurbsSurface()
+    if ns is None:
+        return None
+    C, W, ku, kv, pu, pv = _nurbs_arrays(ns)
+    P, N = nurbs_grid(C, W, ku, kv, pu, pv, us, vs)
+    ln = np.linalg.norm(N, axis=2)
+    size = max(float(np.ptp(P.reshape(-1, 3), 0).max()), 1e-9)
+    nv, nu = ln.shape
+    for j, i in ((0, 0), (nv // 3, nu // 2), (nv - 1, nu - 1), (nv // 2, nu // 5)):
+        p = srf.PointAt(float(us[i]), float(vs[j]))
+        n = srf.NormalAt(float(us[i]), float(vs[j]))
+        if np.linalg.norm(P[j, i] - (p.X, p.Y, p.Z)) > 1e-6 * size:
+            return None
+        if ln[j, i] > 1e-12 * size * size and np.dot(N[j, i] / ln[j, i], (n.X, n.Y, n.Z)) < 0.999:
+            return None
+    bad = ln <= 1e-9 * ln.max()                    # poles: ask Rhino there
+    for j, i in zip(*np.nonzero(bad)):
+        n = srf.NormalAt(float(us[i]), float(vs[j]))
+        N[j, i] = (n.X, n.Y, n.Z)
+        ln[j, i] = 1.0
+    return P, N / ln[..., None]
+
+
 def _evaluate(srf, nu, nv, closed_u, closed_v):
     """Points and unit normals on an (nv, nu) parameter grid."""
     du, dv = srf.Domain(0), srf.Domain(1)
     us = np.linspace(du.T0, du.T1, nu, endpoint=not closed_u)
     vs = np.linspace(dv.T0, dv.T1, nv, endpoint=not closed_v)
+    try:
+        fast = _evaluate_fast(srf, us, vs)
+    except Exception:
+        fast = None
+    if fast is not None:
+        return fast
     P = np.zeros((nv, nu, 3))
     N = np.zeros((nv, nu, 3))
     for j, v in enumerate(vs.tolist()):
@@ -453,8 +563,48 @@ def _srf_key(srf):
                   du.T0, du.T1, dv.T0, dv.T1] + pts)
 
 
+def _net_array(net_type, n, data):
+    """A .NET array of n structs filled with the raw bytes of a NumPy array
+    in one copy (base64 is the fastest way across from Python)."""
+    import base64
+    import System
+    from System.Runtime.InteropServices import Marshal, GCHandle, GCHandleType
+    arr = System.Array.CreateInstance(net_type, n)
+    src = System.Convert.FromBase64String(base64.b64encode(data.tobytes()).decode("ascii"))
+    h = GCHandle.Alloc(arr, GCHandleType.Pinned)
+    try:
+        Marshal.Copy(src, 0, h.AddrOfPinnedObject(), src.Length)
+    finally:
+        h.Free()
+    return arr
+
+
+def _fast_mesh(V, F):
+    """Whole mesh in a few calls: Point3f is 3 floats, MeshFace 4 ints
+    (a triangle repeats its last index, like our face array)."""
+    try:
+        m = rg.Mesh()
+        m.Vertices.AddVertices(_net_array(rg.Point3f, len(V), np.ascontiguousarray(V, np.float32)))
+        m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
+        k = len(V) // 2
+        p, f = m.Vertices[k], m.Faces[len(F) - 1]
+        if (m.Vertices.Count != len(V) or m.Faces.Count != len(F)
+                or abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max())
+                or (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1])):
+            return None
+        m.Normals.ComputeNormals()
+        m.FaceNormals.ComputeFaceNormals()
+        return m
+    except Exception:
+        return None
+
+
 def _to_rhino_mesh(V, F, cache, key):
-    """Faces are built once per topology and reused; only vertices move."""
+    """Fast path first. Fallback: faces are built once per topology and
+    reused, and only the vertices are moved (slow for big meshes)."""
+    m = _fast_mesh(V, F)
+    if m is not None:
+        return m
     m = cache.get(key)
     if m is None:
         m = rg.Mesh()
@@ -490,14 +640,26 @@ def run_grasshopper():
     invert = bool(_val("invert", False))
     mirror = bool(_val("mirror", False))
     mode = "mirror" if mirror else "repeat"
-    proc_key = (st["img_key"], blur_px, invert, mode)
-    if st.get("proc_key") != proc_key:
-        H = normalize(smooth_image(H0, blur_px, blur_px, mode))
-        st["H"] = 1.0 - H if invert else H
-        st["proc_key"] = proc_key
-    H = st["H"]
-    if bool(_val("swap", False)):
-        H = np.rot90(H, 1)                 # image runs up the surface instead
+    swap = bool(_val("swap", False))
+    H = np.rot90(H0, 1) if swap else H0    # image runs up the surface instead
+    procs = st.setdefault("procs", {})
+
+    def processed(nu, nv, ru, rv):
+        """The image at the size this mesh needs (about 2 px per vertex),
+        blurred and stretched. Cached: only blur / invert / mirror / swap
+        or a big change in size recompute it."""
+        tw = int(min(H.shape[1], 16 * math.ceil(2.0 * (nu - 1) / max(ru, 1e-9) / 16)))
+        th = int(min(H.shape[0], 16 * math.ceil(2.0 * (nv - 1) / max(rv, 1e-9) / 16)))
+        key = (st["img_key"], swap, tw, th, blur_px, invert, mode)
+        if key not in procs:
+            Hs = downsample(H, tw, th)
+            s = Hs.shape[1] / float(H.shape[1])
+            Hs = normalize(smooth_image(Hs, blur_px * s, blur_px * s, mode))
+            if len(procs) > 8:
+                procs.clear()
+            procs[key] = 1.0 - Hs if invert else Hs
+        return procs[key]
+    t_img = time.time()
 
     geos = _val("base", None)
     surfaces, skipped = _surfaces(geos if isinstance(geos, (list, tuple)) else [geos])
@@ -518,7 +680,11 @@ def run_grasshopper():
     meshes = st.setdefault("meshes", {})
     out_m, out_h, notes = [], [], []
     used_grids, used_meshes = set(), set()
+    want_heights = any(o.NickName == "heights" and o.Recipients.Count > 0
+                       for o in comp.Params.Output)
+    t_srf = t_rel = t_mesh = 0.0
     for srf, reversed_face in surfaces:
+        t1 = time.time()
         cu, cv = srf.IsClosed(0), srf.IsClosed(1)
         skey = _srf_key(srf)
         # --- grid size from the real surface size ---------------------------
@@ -546,7 +712,10 @@ def run_grasshopper():
         depth = _val("depth", None)
         depth = 0.03 * min(len_u, len_v) if depth is None else float(depth)
         ru, rv = plan_repeats(len_u, len_v, H.shape[1], H.shape[0], tile_size, cu, cv, mirror)
-        Pd, h = relief(P, N, H, depth, ru, rv, cu, cv, mode, off_u, off_v, fade, gamma)
+        t_srf += time.time() - t1
+        t1 = time.time()
+        Pd, h = relief(P, N, processed(nu, nv, ru, rv), depth, ru, rv, cu, cv,
+                       mode, off_u, off_v, fade, gamma)
         back = P - N * thickness if thickness > 0 else None
         V, F = build_mesh(Pd, cu, cv, back, cap)
         mkey = (nu, nv, cu, cv, back is not None, cap)
@@ -554,12 +723,16 @@ def run_grasshopper():
             F = F[:, [0, 3, 2, 1]]
             mkey += ("flipped",)
         used_meshes.add(mkey)
+        t_rel += time.time() - t1
+        t1 = time.time()
         m = _to_rhino_mesh(V, F, meshes, mkey)
         if back is not None or (cap and cu != cv):
             if m.SolidOrientation() == -1:
                 m.Flip(True, True, True)
+        t_mesh += time.time() - t1
         out_m.append(m)
-        out_h.extend(h.reshape(-1).tolist())
+        if want_heights:                    # thousands of numbers: only if used
+            out_h.extend(h.reshape(-1).tolist())
         notes.append("{}x{} vertices, {:.3g} x {:.3g} copies, depth {:g}".format(
             nu, nv, ru, rv, depth))
 
@@ -571,12 +744,16 @@ def run_grasshopper():
             meshes.pop(k)
 
     ms = (time.time() - t0) * 1000.0
-    txt = "image {}x{} ({}) | {} | {:.0f} ms".format(
-        H0.shape[1], H0.shape[0], st.get("img_by"), " ; ".join(notes), ms)
+    txt = ("image {}x{} ({}) | {} | {:.0f} ms (image {:.0f}, surface {:.0f}, "
+           "relief {:.0f}, mesh {:.0f})").format(
+        H0.shape[1], H0.shape[0], st.get("img_by"), " ; ".join(notes), ms,
+        (t_img - t0) * 1000, t_srf * 1000, t_rel * 1000, t_mesh * 1000)
+    if not want_heights:
+        txt += " | heights: connect it to get values"
     if skipped:
         txt += " | skipped {} trimmed / unsupported face(s)".format(skipped)
     comp.Message = "{} vertices".format(sum(m.Vertices.Count for m in out_m))
-    return (out_m[0] if len(out_m) == 1 else out_m), out_h, txt
+    return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
 
 
 if IN_RHINO:
