@@ -374,6 +374,8 @@ try:
 except ImportError:
     IN_RHINO = False
 
+VERSION = "v8"             # shown first in `info`, so you can see which script runs
+DIAG = {}                  # which fast paths worked, and why not (for `info`)
 MAX_PX = 2048              # bigger images are scaled down (enough for any mesh)
 MAX_VERTS = 1500000
 
@@ -535,9 +537,13 @@ def _evaluate(srf, nu, nv, closed_u, closed_v):
     vs = np.linspace(dv.T0, dv.T1, nv, endpoint=not closed_v)
     try:
         fast = _evaluate_fast(srf, us, vs)
-    except Exception:
+        if fast is None:
+            DIAG["surface"] = "slow (NumPy didn't match Rhino)"
+    except Exception as e:
         fast = None
+        DIAG["surface"] = "slow (fast path error: {}: {})".format(type(e).__name__, str(e)[:120])
     if fast is not None:
+        DIAG["surface"] = "fast"
         return fast
     P = np.zeros((nv, nu, 3))
     N = np.zeros((nv, nu, 3))
@@ -569,7 +575,8 @@ def _net_array(net_type, n, data):
     import base64
     import System
     from System.Runtime.InteropServices import Marshal, GCHandle, GCHandleType
-    arr = System.Array.CreateInstance(net_type, n)
+    import clr
+    arr = System.Array.CreateInstance(clr.GetClrType(net_type), n)
     src = System.Convert.FromBase64String(base64.b64encode(data.tobytes()).decode("ascii"))
     h = GCHandle.Alloc(arr, GCHandleType.Pinned)
     try:
@@ -579,24 +586,81 @@ def _net_array(net_type, n, data):
     return arr
 
 
+def _check_mesh(m, V, F, how):
+    """True if the Rhino mesh holds exactly V and F."""
+    if m.Vertices.Count != len(V) or m.Faces.Count != len(F):
+        DIAG["mesh_" + how] = "gave {} / {} vertices".format(m.Vertices.Count, len(V))
+        return False
+    for k in (0, len(V) // 2, len(V) - 1):
+        p = m.Vertices[k]
+        if abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max()):
+            DIAG["mesh_" + how] = "vertex mismatch"
+            return False
+    f = m.Faces[len(F) - 1]
+    if (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1]):
+        DIAG["mesh_" + how] = "face mismatch"
+        return False
+    return True
+
+
+def _add_all(method, arr, T):
+    """Calls Mesh.Vertices.AddVertices / Mesh.Faces.AddFaces with a .NET
+    array. Python.NET can pick the wrong overload (Point3d vs Point3f), so
+    the IEnumerable<T> version is asked for explicitly in a few ways."""
+    from System.Collections.Generic import IEnumerable, List
+    tries = (lambda: method.Overloads[IEnumerable[T]](arr),
+             lambda: method(IEnumerable[T](arr)),
+             lambda: method(List[T](arr)),
+             lambda: method(arr))
+    err = None
+    for k, call in enumerate(tries):
+        try:
+            call()
+            return k
+        except Exception as e:
+            err = e
+    raise err
+
+
+def _mesh_by_copy(V, F):
+    """Fastest: copy the raw bytes into .NET Point3d / MeshFace arrays
+    (Point3d is 3 doubles, MeshFace 4 ints)."""
+    m = rg.Mesh()
+    _add_all(m.Vertices.AddVertices,
+             _net_array(rg.Point3d, len(V), np.ascontiguousarray(V, np.float64)), rg.Point3d)
+    _add_all(m.Faces.AddFaces,
+             _net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)), rg.MeshFace)
+    return m
+
+
+def _mesh_by_list(V, F):
+    """Fast enough: make the structs in Python, hand them over in one call
+    each (the slow part of the old way was one Rhino call per vertex)."""
+    import System
+    P3d, MF = rg.Point3d, rg.MeshFace
+    pts = System.Array[P3d]([P3d(x, y, z) for x, y, z in V.tolist()])
+    fcs = System.Array[MF]([MF(a, b, c, d) for a, b, c, d in F.tolist()])
+    m = rg.Mesh()
+    _add_all(m.Vertices.AddVertices, pts, P3d)
+    _add_all(m.Faces.AddFaces, fcs, MF)
+    return m
+
+
 def _fast_mesh(V, F):
-    """Whole mesh in a few calls: Point3f is 3 floats, MeshFace 4 ints
-    (a triangle repeats its last index, like our face array)."""
-    try:
-        m = rg.Mesh()
-        m.Vertices.AddVertices(_net_array(rg.Point3f, len(V), np.ascontiguousarray(V, np.float32)))
-        m.Faces.AddFaces(_net_array(rg.MeshFace, len(F), np.ascontiguousarray(F, np.int32)))
-        k = len(V) // 2
-        p, f = m.Vertices[k], m.Faces[len(F) - 1]
-        if (m.Vertices.Count != len(V) or m.Faces.Count != len(F)
-                or abs(p.X - V[k, 0]) + abs(p.Y - V[k, 1]) + abs(p.Z - V[k, 2]) > 1e-3 * (1 + abs(V[k]).max())
-                or (f.A, f.B, f.C, f.D) != tuple(int(x) for x in F[-1])):
-            return None
-        m.Normals.ComputeNormals()
-        m.FaceNormals.ComputeFaceNormals()
-        return m
-    except Exception:
-        return None
+    """Tries the fast ways in turn; each result is checked against V and F.
+    A triangle repeats its last index, which is also Rhino's convention."""
+    for how, build in (("copy", _mesh_by_copy), ("list", _mesh_by_list)):
+        try:
+            m = build(V, F)
+            if _check_mesh(m, V, F, how):
+                m.Normals.ComputeNormals()
+                m.FaceNormals.ComputeFaceNormals()
+                DIAG["mesh"] = how
+                return m
+        except Exception as e:
+            DIAG["mesh_" + how] = "{}: {}".format(type(e).__name__, str(e)[:100])
+    DIAG["mesh"] = "slow (one vertex at a time)"
+    return None
 
 
 def _to_rhino_mesh(V, F, cache, key):
@@ -629,6 +693,7 @@ def run_grasshopper():
     store = sc.sticky.setdefault("image_relief", {})
     st = store.setdefault(str(comp.InstanceGuid), {})
     t0 = time.time()
+    DIAG.clear()
 
     path = _val("image", None)
     if not path:
@@ -744,7 +809,7 @@ def run_grasshopper():
             meshes.pop(k)
 
     ms = (time.time() - t0) * 1000.0
-    txt = ("image {}x{} ({}) | {} | {:.0f} ms (image {:.0f}, surface {:.0f}, "
+    txt = (VERSION + " | image {}x{} ({}) | {} | {:.0f} ms (image {:.0f}, surface {:.0f}, "
            "relief {:.0f}, mesh {:.0f})").format(
         H0.shape[1], H0.shape[0], st.get("img_by"), " ; ".join(notes), ms,
         (t_img - t0) * 1000, t_srf * 1000, t_rel * 1000, t_mesh * 1000)
@@ -752,8 +817,39 @@ def run_grasshopper():
         txt += " | heights: connect it to get values"
     if skipped:
         txt += " | skipped {} trimmed / unsupported face(s)".format(skipped)
-    comp.Message = "{} vertices".format(sum(m.Vertices.Count for m in out_m))
-    return (out_m[0] if len(out_m) == 1 else out_m), (out_h or None), txt
+    bad = [m for m in out_m if not m.IsValid]
+    if bad:
+        ok, log = bad[0].IsValidWithLog()
+        txt += " | INVALID MESH: " + str(log).strip().replace("\n", " ")[:300]
+    names = [o.NickName for o in comp.Params.Output]
+    for need in ("mesh", "heights", "info"):
+        if need not in names:
+            txt += " | WARNING: no output named '{}' (outputs are: {})".format(need, ", ".join(names))
+    txt += " | paths: surface {}, mesh {}".format(DIAG.get("surface", "cached"), DIAG.get("mesh", "-"))
+    errs = ["{} failed ({})".format(k[5:], v) for k, v in sorted(DIAG.items()) if k.startswith("mesh_")]
+    if errs:
+        txt += " | " + "; ".join(errs)
+    out_param = [o for o in comp.Params.Output if o.NickName == "mesh"]
+    if out_param:
+        o = out_param[0]
+        if o.TypeName == "Text":
+            txt += (" | WARNING: the mesh output is set to Text, so it stays empty. Right-click it"
+                    " -> Type Hint -> No Type Hint, or delete it and add a new `mesh` output")
+    for m in out_m[:1]:
+        b = m.GetBoundingBox(False)
+        txt += " | mesh out: {} V{} F{} valid={} closed={} box {:.0f}x{:.0f}x{:.0f} at ({:.0f}, {:.0f}, {:.0f})".format(
+            type(m).__name__, m.Vertices.Count, m.Faces.Count, m.IsValid, m.IsClosed,
+            b.Max.X - b.Min.X, b.Max.Y - b.Min.Y, b.Max.Z - b.Min.Z, b.Min.X, b.Min.Y, b.Min.Z)
+    comp.Message = "{} vertices, {:.0f} ms".format(sum(m.Vertices.Count for m in out_m), ms)
+    # Hand Grasshopper ready-made GH_Mesh objects, so it doesn't have to
+    # convert the Python result itself
+    try:
+        import Grasshopper
+        out_g = [Grasshopper.Kernel.Types.GH_Mesh(m) for m in out_m]
+    except Exception as e:
+        out_g = out_m
+        txt += " | GH_Mesh wrap failed: {}".format(e)
+    return (out_g[0] if len(out_g) == 1 else out_g), (out_h or None), txt
 
 
 if IN_RHINO:
